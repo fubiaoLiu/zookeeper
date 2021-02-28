@@ -18,28 +18,21 @@
 
 package org.apache.zookeeper.server.quorum;
 
-import java.io.IOException;
-import java.util.concurrent.TimeUnit;
-import javax.management.JMException;
 import org.apache.zookeeper.KeeperException.SessionExpiredException;
 import org.apache.zookeeper.jmx.MBeanRegistry;
 import org.apache.zookeeper.metrics.MetricsContext;
-import org.apache.zookeeper.server.ContainerManager;
-import org.apache.zookeeper.server.DataTreeBean;
-import org.apache.zookeeper.server.FinalRequestProcessor;
-import org.apache.zookeeper.server.PrepRequestProcessor;
-import org.apache.zookeeper.server.Request;
-import org.apache.zookeeper.server.RequestProcessor;
-import org.apache.zookeeper.server.ServerCnxn;
-import org.apache.zookeeper.server.ServerMetrics;
-import org.apache.zookeeper.server.ZKDatabase;
+import org.apache.zookeeper.server.*;
 import org.apache.zookeeper.server.persistence.FileTxnSnapLog;
+
+import javax.management.JMException;
+import java.io.IOException;
+import java.util.concurrent.TimeUnit;
 
 /**
  *
  * Just like the standard ZooKeeperServer. We just replace the request
- * processors: PrepRequestProcessor -&gt; ProposalRequestProcessor -&gt;
- * CommitProcessor -&gt; Leader.ToBeAppliedRequestProcessor -&gt;
+ * processors: PrepRequestProcessor -> ProposalRequestProcessor ->
+ * CommitProcessor -> Leader.ToBeAppliedRequestProcessor ->
  * FinalRequestProcessor
  */
 public class LeaderZooKeeperServer extends QuorumZooKeeperServer {
@@ -63,6 +56,8 @@ public class LeaderZooKeeperServer extends QuorumZooKeeperServer {
 
     @Override
     protected void setupRequestProcessors() {
+        // LeaderRequestProcessor -> PrepRequestProcessor -> ProposalRequestProcessor
+        //  -> CommitProcessor -> Leader.ToBeAppliedRequestProcessor -> FinalRequestProcessor
         RequestProcessor finalProcessor = new FinalRequestProcessor(this);
         RequestProcessor toBeAppliedProcessor = new Leader.ToBeAppliedRequestProcessor(finalProcessor, getLeader());
         commitProcessor = new CommitProcessor(toBeAppliedProcessor, Long.toString(getServerId()), false, getZooKeeperServerListener());
@@ -78,11 +73,11 @@ public class LeaderZooKeeperServer extends QuorumZooKeeperServer {
 
     private synchronized void setupContainerManager() {
         containerManager = new ContainerManager(
-            getZKDatabase(),
-            prepRequestProcessor,
-            Integer.getInteger("znode.container.checkIntervalMs", (int) TimeUnit.MINUTES.toMillis(1)),
-            Integer.getInteger("znode.container.maxPerMinute", 10000),
-            Long.getLong("znode.container.maxNeverUsedIntervalMs", 0)
+                getZKDatabase(),
+                prepRequestProcessor,
+                Integer.getInteger("znode.container.checkIntervalMs", (int) TimeUnit.MINUTES.toMillis(1)),
+                Integer.getInteger("znode.container.maxPerMinute", 10000),
+                Long.getLong("znode.container.maxNeverUsedIntervalMs", 0)
         );
     }
 
@@ -164,12 +159,12 @@ public class LeaderZooKeeperServer extends QuorumZooKeeperServer {
     @Override
     public void createSessionTracker() {
         sessionTracker = new LeaderSessionTracker(
-            this,
-            getZKDatabase().getSessionWithTimeOuts(),
-            tickTime,
-            self.getId(),
-            self.areLocalSessionsEnabled(),
-            getZooKeeperServerListener());
+                this,
+                getZKDatabase().getSessionWithTimeOuts(),
+                tickTime,
+                self.getId(),
+                self.areLocalSessionsEnabled(),
+                getZooKeeperServerListener());
     }
 
     public boolean touch(long sess, int to) {

@@ -18,6 +18,8 @@
 
 package org.apache.zookeeper.server;
 
+import org.apache.zookeeper.common.Time;
+
 import java.io.PrintWriter;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -25,7 +27,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
-import org.apache.zookeeper.common.Time;
 
 /**
  * ExpiryQueue tracks elements in time sorted fixed duration buckets.
@@ -51,6 +52,11 @@ public class ExpiryQueue<E> {
     }
 
     private long roundToNextInterval(long time) {
+        // time表示过期的时间，过期间隔默认是10s
+        // time = 10000020，expiryTime = 10000030
+        // time = 10000030，expiryTime = 10000040
+        // time = 10000031，expiryTime = 10000040
+        // time = 10000039，expiryTime = 10000040
         return (time / expirationInterval + 1) * expirationInterval;
     }
 
@@ -82,16 +88,21 @@ public class ExpiryQueue<E> {
      *                 changed, or null if unchanged
      */
     public Long update(E elem, int timeout) {
+        // 获取旧的过期时间
         Long prevExpiryTime = elemMap.get(elem);
         long now = Time.currentElapsedTime();
+        // 计算新的过期时间，按照过期时间间隔进行分桶
         Long newExpiryTime = roundToNextInterval(now + timeout);
 
+        // 如果新过期时间和旧过期时间一样，直接返回，
+        // 否则更新过期时间、移动到新的分桶
         if (newExpiryTime.equals(prevExpiryTime)) {
             // No change, so nothing to update
             return null;
         }
 
         // First add the elem to the new expiry time bucket in expiryMap.
+        // 添加到新的分桶
         Set<E> set = expiryMap.get(newExpiryTime);
         if (set == null) {
             // Construct a ConcurrentHashSet using a ConcurrentHashMap
@@ -107,7 +118,9 @@ public class ExpiryQueue<E> {
 
         // Map the elem to the new expiry time. If a different previous
         // mapping was present, clean up the previous expiry bucket.
+        // 更新过期时间
         prevExpiryTime = elemMap.put(elem, newExpiryTime);
+        // 从旧的分桶中移除
         if (prevExpiryTime != null && !newExpiryTime.equals(prevExpiryTime)) {
             Set<E> prevSet = expiryMap.get(prevExpiryTime);
             if (prevSet != null) {
@@ -176,11 +189,10 @@ public class ExpiryQueue<E> {
     }
 
     /**
-     * Returns an unmodifiable view of the expiration time -&gt; elements mapping.
+     * Returns an unmodifiable view of the expiration time -> elements mapping.
      */
     public Map<Long, Set<E>> getExpiryMap() {
         return Collections.unmodifiableMap(expiryMap);
     }
 
 }
-

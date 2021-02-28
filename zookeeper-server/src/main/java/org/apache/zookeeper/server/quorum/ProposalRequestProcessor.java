@@ -29,6 +29,8 @@ import org.slf4j.LoggerFactory;
 /**
  * This RequestProcessor simply forwards requests to an AckRequestProcessor and
  * SyncRequestProcessor.
+ *
+ * 该处理器只是将请求转发给AckRequestProcessor和SyncRequestProcessor
  */
 public class ProposalRequestProcessor implements RequestProcessor {
 
@@ -43,7 +45,7 @@ public class ProposalRequestProcessor implements RequestProcessor {
     // If this property is set, requests from Learners won't be forwarded
     // to the CommitProcessor in order to save resources
     public static final String FORWARD_LEARNER_REQUESTS_TO_COMMIT_PROCESSOR_DISABLED =
-          "zookeeper.forward_learner_requests_to_commit_processor_disabled";
+            "zookeeper.forward_learner_requests_to_commit_processor_disabled";
     private final boolean forwardLearnerRequestsToCommitProcessorDisabled;
 
     public ProposalRequestProcessor(LeaderZooKeeperServer zks, RequestProcessor nextProcessor) {
@@ -73,19 +75,25 @@ public class ProposalRequestProcessor implements RequestProcessor {
          * contain the handler. In this case, we add it to syncHandler, and
          * call processRequest on the next processor.
          */
+        // 接收到的sync请求才会走这个分支，sync请求是要等所有follower都完成数据同步后才会返回，实现数据强一致
+        // 其他请求都是走下面的分支
         if (request instanceof LearnerSyncRequest) {
             zks.getLeader().processSync((LearnerSyncRequest) request);
         } else {
             if (shouldForwardToNextProcessor(request)) {
                 nextProcessor.processRequest(request);
             }
+            // create请求hdr不为空，在PrepRequestProcessor会设置hdr
+            // sync请求hdr为空
             if (request.getHdr() != null) {
                 // We need to sync and get consensus on any transactions
                 try {
+                    // 创建一个propose然后发送给follower
                     zks.getLeader().propose(request);
                 } catch (XidRolloverException e) {
                     throw new RequestProcessorException(e.getMessage(), e);
                 }
+                // 将请求写入本地事务日志文件
                 syncProcessor.processRequest(request);
             }
         }

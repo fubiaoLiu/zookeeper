@@ -18,53 +18,11 @@
 
 package org.apache.zookeeper.server.quorum;
 
-import static java.nio.charset.StandardCharsets.UTF_8;
-import java.io.BufferedInputStream;
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
-import java.io.IOException;
-import java.net.InetSocketAddress;
-import java.net.ServerSocket;
-import java.net.Socket;
-import java.net.SocketAddress;
-import java.net.SocketException;
-import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Optional;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.stream.Collectors;
-import javax.security.sasl.SaslException;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.ZooDefs.OpCode;
 import org.apache.zookeeper.common.Time;
 import org.apache.zookeeper.jmx.MBeanRegistry;
-import org.apache.zookeeper.server.ExitCode;
-import org.apache.zookeeper.server.FinalRequestProcessor;
-import org.apache.zookeeper.server.Request;
-import org.apache.zookeeper.server.RequestProcessor;
-import org.apache.zookeeper.server.ServerMetrics;
-import org.apache.zookeeper.server.ZKDatabase;
-import org.apache.zookeeper.server.ZooKeeperCriticalThread;
-import org.apache.zookeeper.server.ZooTrace;
+import org.apache.zookeeper.server.*;
 import org.apache.zookeeper.server.quorum.QuorumPeer.LearnerType;
 import org.apache.zookeeper.server.quorum.auth.QuorumAuthServer;
 import org.apache.zookeeper.server.quorum.flexible.QuorumVerifier;
@@ -73,6 +31,18 @@ import org.apache.zookeeper.server.util.ZxidUtils;
 import org.apache.zookeeper.util.ServiceUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import javax.security.sasl.SaslException;
+import java.io.*;
+import java.net.*;
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
+
+import static java.nio.charset.StandardCharsets.UTF_8;
 
 /**
  * This class has the control logic for the Leader.
@@ -293,11 +263,12 @@ public class Leader extends LearnerMaster {
             addresses = self.getQuorumAddress().getAllAddresses();
         }
 
+        // 给每个peer都创建对应的serverSocket
         addresses.stream()
-          .map(address -> createServerSocket(address, self.shouldUsePortUnification(), self.isSslQuorum()))
-          .filter(Optional::isPresent)
-          .map(Optional::get)
-          .forEach(serverSockets::add);
+                .map(address -> createServerSocket(address, self.shouldUsePortUnification(), self.isSslQuorum()))
+                .filter(Optional::isPresent)
+                .map(Optional::get)
+                .forEach(serverSockets::add);
 
         if (serverSockets.isEmpty()) {
             throw new IOException("Leader failed to initialize any of the following sockets: " + addresses);
@@ -325,16 +296,19 @@ public class Leader extends LearnerMaster {
 
     /**
      * This message is for follower to expect diff
+     * 表示follower和leader有差异
      */
     static final int DIFF = 13;
 
     /**
      * This is for follower to truncate its logs
+     * 表示follower要截断日志
      */
     static final int TRUNC = 14;
 
     /**
      * This is for follower to download the snapshots
+     * 表示follower需要下载快照
      */
     static final int SNAP = 15;
 
@@ -440,10 +414,10 @@ public class Leader extends LearnerMaster {
 
         LearnerCnxAcceptor() {
             super("LearnerCnxAcceptor-" + serverSockets.stream()
-                      .map(ServerSocket::getLocalSocketAddress)
-                      .map(Objects::toString)
-                      .collect(Collectors.joining("|")),
-                  zk.getZooKeeperServerListener());
+                            .map(ServerSocket::getLocalSocketAddress)
+                            .map(Objects::toString)
+                            .collect(Collectors.joining("|")),
+                    zk.getZooKeeperServerListener());
         }
 
         @Override
@@ -452,6 +426,10 @@ public class Leader extends LearnerMaster {
                 ExecutorService executor = Executors.newFixedThreadPool(serverSockets.size());
                 CountDownLatch latch = new CountDownLatch(serverSockets.size());
 
+                // 给每个serverSocket创建一个handler丢给线程池进行处理
+                // 用来处理创建连接的请求
+                // 这个是基于Java原生的BIO来实现的
+                // 建立连接后会给每个socket创建对应的LearnerHandler线程，用来处理这个socket对应的请求和响应
                 serverSockets.forEach(serverSocket ->
                         executor.submit(new LearnerCnxAcceptorHandler(serverSocket, latch)));
 
@@ -596,11 +574,19 @@ public class Leader extends LearnerMaster {
 
             // Start thread that waits for connection requests from
             // new followers.
+            // 初始化并启动follower连接Acceptor处理线程
+            // 会给每个ServerSocket创建一个LearnerCnxAcceptorHandler然后交给线程池处理
+            // LearnerCnxAcceptorHandler用来处理建立连接的请求
+            // handler会阻塞在那里等待follower跟他建立连接，这个是基于Java原生的BIO来实现的
+            // 建立连接后会给每个socket创建对应的LearnerHandler线程，用来处理这个socket对应的请求和响应
+            // 当所有LearnerCnxAcceptorHandler线程都退出后，Acceptor处理线程也会退出，否则会通过CountDownLatch阻塞在那里
             cnxAcceptor = new LearnerCnxAcceptor();
             cnxAcceptor.start();
 
             long epoch = getEpochToPropose(self.getId(), self.getAcceptedEpoch());
 
+            // 初始化zxid，基于位运算实现
+            // 高32位表示epoch，低32位是从0开始的自增长值
             zk.setZxid(ZxidUtils.makeZxid(epoch, 0));
 
             synchronized (this) {
@@ -663,8 +649,8 @@ public class Leader extends LearnerMaster {
                 waitForNewLeaderAck(self.getId(), zk.getZxid());
             } catch (InterruptedException e) {
                 shutdown("Waiting for a quorum of followers, only synced with sids: [ "
-                         + newLeaderProposal.ackSetsToString()
-                         + " ]");
+                        + newLeaderProposal.ackSetsToString()
+                        + " ]");
                 HashSet<Long> followerSet = new HashSet<Long>();
 
                 for (LearnerHandler f : getLearners()) {
@@ -685,6 +671,7 @@ public class Leader extends LearnerMaster {
                 return;
             }
 
+            // 启动ZooKeeperServer，这里会创建SessionTracker
             startZkServer();
 
             /**
@@ -706,6 +693,7 @@ public class Leader extends LearnerMaster {
             }
 
             if (!System.getProperty("zookeeper.leaderServes", "yes").equals("no")) {
+                // cnxnFactory中的zkServer是在这里设置进去的
                 self.setZooKeeperServer(zk);
             }
 
@@ -738,7 +726,7 @@ public class Leader extends LearnerMaster {
                     SyncedLearnerTracker syncedAckSet = new SyncedLearnerTracker();
                     syncedAckSet.addQuorumVerifier(self.getQuorumVerifier());
                     if (self.getLastSeenQuorumVerifier() != null
-                        && self.getLastSeenQuorumVerifier().getVersion() > self.getQuorumVerifier().getVersion()) {
+                            && self.getLastSeenQuorumVerifier().getVersion() > self.getQuorumVerifier().getVersion()) {
                         syncedAckSet.addQuorumVerifier(self.getLastSeenQuorumVerifier());
                     }
 
@@ -761,8 +749,8 @@ public class Leader extends LearnerMaster {
                         // Lost quorum of last committed and/or last proposed
                         // config, set shutdown flag
                         shutdownMessage = "Not sufficient followers synced, only synced with sids: [ "
-                                          + syncedAckSet.ackSetsToString()
-                                          + " ]";
+                                + syncedAckSet.ackSetsToString()
+                                + " ]";
                         break;
                     }
                     tickSkip = !tickSkip;
@@ -819,15 +807,15 @@ public class Leader extends LearnerMaster {
     }
 
     synchronized void closeSockets() {
-       for (ServerSocket serverSocket : serverSockets) {
-           if (!serverSocket.isClosed()) {
-               try {
-                   serverSocket.close();
-               } catch (IOException e) {
-                   LOG.warn("Ignoring unexpected exception during close {}", serverSocket, e);
-               }
-           }
-       }
+        for (ServerSocket serverSocket : serverSockets) {
+            if (!serverSocket.isClosed()) {
+                try {
+                    serverSocket.close();
+                } catch (IOException e) {
+                    LOG.warn("Ignoring unexpected exception during close {}", serverSocket, e);
+                }
+            }
+        }
     }
 
     /** In a reconfig operation, this method attempts to find the best leader for next configuration.
@@ -847,7 +835,7 @@ public class Leader extends LearnerMaster {
         //check if I'm in the new configuration with the same quorum address -
         // if so, I'll remain the leader
         if (newQVAcksetPair.getQuorumVerifier().getVotingMembers().containsKey(self.getId())
-            && newQVAcksetPair.getQuorumVerifier().getVotingMembers().get(self.getId()).addr.equals(self.getQuorumAddress())) {
+                && newQVAcksetPair.getQuorumVerifier().getVotingMembers().get(self.getId()).addr.equals(self.getQuorumAddress())) {
             return self.getId();
         }
         // start with an initial set of candidates that are voters from new config that
@@ -895,6 +883,7 @@ public class Leader extends LearnerMaster {
         // pending all wait for a quorum of old and new config, so it's not possible to get enough acks
         // for an operation without getting enough acks for preceding ops. But in the future if multiple
         // concurrent reconfigs are allowed, this can happen.
+        // 这个是确保按顺序提交
         if (outstandingProposals.containsKey(zxid - 1)) {
             return false;
         }
@@ -902,6 +891,7 @@ public class Leader extends LearnerMaster {
         // in order to be committed, a proposal must be accepted by a quorum.
         //
         // getting a quorum from all necessary configurations.
+        // 如果超过一半的follower返回了ack，则可以执行commit，否则返回false，不能执行commit
         if (!p.hasAllQuorums()) {
             return false;
         }
@@ -909,9 +899,9 @@ public class Leader extends LearnerMaster {
         // commit proposals in order
         if (zxid != lastCommitted + 1) {
             LOG.warn(
-                "Commiting zxid 0x{} from {} noy first!",
-                Long.toHexString(zxid),
-                followerAddr);
+                    "Commiting zxid 0x{} from {} noy first!",
+                    Long.toHexString(zxid),
+                    followerAddr);
             LOG.warn("First is {}", (lastCommitted + 1));
         }
 
@@ -948,11 +938,16 @@ public class Leader extends LearnerMaster {
             commitAndActivate(zxid, designatedLeader);
             informAndActivate(p, designatedLeader);
         } else {
+            // 正常会走到这里，给所有follower再发送commit请求
             p.request.logLatency(ServerMetrics.getMetrics().QUORUM_ACK_LATENCY);
             commit(zxid);
+            // 这里会将packet发送给所有observer
             inform(p);
         }
+        // 执行commit，将请求放入CommitProcessor处理器的committedRequests队列，CommitProcessor线程运行时会处理
         zk.commitProcessor.commit(p.request);
+
+        // 处理sync同步请求
         if (pendingSyncs.containsKey(zxid)) {
             for (LearnerSyncRequest r : pendingSyncs.remove(zxid)) {
                 sendSync(r);
@@ -1000,12 +995,13 @@ public class Leader extends LearnerMaster {
         }
         if (lastCommitted >= zxid) {
             LOG.debug(
-                "proposal has already been committed, pzxid: 0x{} zxid: 0x{}",
-                Long.toHexString(lastCommitted),
-                Long.toHexString(zxid));
+                    "proposal has already been committed, pzxid: 0x{} zxid: 0x{}",
+                    Long.toHexString(lastCommitted),
+                    Long.toHexString(zxid));
             // The proposal has already been committed
             return;
         }
+        // 获取ack对应的proposal
         Proposal p = outstandingProposals.get(zxid);
         if (p == null) {
             LOG.warn("Trying to commit future proposal: zxid 0x{} from {}", Long.toHexString(zxid), followerAddr);
@@ -1016,8 +1012,12 @@ public class Leader extends LearnerMaster {
             p.request.logLatency(ServerMetrics.getMetrics().ACK_LATENCY, Long.toString(sid));
         }
 
+        // 更新ack集合，在ackset集合中添加当前ack的sid
         p.addAck(sid);
 
+        // 尝试commit
+        // 如果可以commit，会发送commit请求给所有follower，并且将数据发送给所有observer
+        // 同时，将commit请求交给CommitProcessor处理
         boolean hasCommitted = tryToCommit(p, zxid, followerAddr);
 
         // If p is a reconfiguration, multiple other operations may be ready to be committed,
@@ -1059,10 +1059,10 @@ public class Leader extends LearnerMaster {
         ToBeAppliedRequestProcessor(RequestProcessor next, Leader leader) {
             if (!(next instanceof FinalRequestProcessor)) {
                 throw new RuntimeException(ToBeAppliedRequestProcessor.class.getName()
-                                           + " must be connected to "
-                                           + FinalRequestProcessor.class.getName()
-                                           + " not "
-                                           + next.getClass().getName());
+                        + " must be connected to "
+                        + FinalRequestProcessor.class.getName()
+                        + " not "
+                        + next.getClass().getName());
             }
             this.leader = leader;
             this.next = next;
@@ -1231,6 +1231,7 @@ public class Leader extends LearnerMaster {
         proposalStats.setLastBufferSize(data.length);
         QuorumPacket pp = new QuorumPacket(Leader.PROPOSAL, request.zxid, data, null);
 
+        // 创建Proposal
         Proposal p = new Proposal();
         p.packet = pp;
         p.request = request;
@@ -1250,6 +1251,7 @@ public class Leader extends LearnerMaster {
 
             lastProposed = p.packet.getZxid();
             outstandingProposals.put(lastProposed, p);
+            // 发送给所有follower
             sendPacket(pp);
         }
         ServerMetrics.getMetrics().PROPOSAL_COUNT.add(1);
@@ -1263,6 +1265,8 @@ public class Leader extends LearnerMaster {
      */
 
     public synchronized void processSync(LearnerSyncRequest r) {
+        // 如果前面没有待发送的proposal，直接发送sync请求给follower
+        // 否则进入pendingSyncs待处理的同步请求集合
         if (outstandingProposals.isEmpty()) {
             sendSync(r);
         } else {
@@ -1354,7 +1358,7 @@ public class Leader extends LearnerMaster {
     /**
      * Quit condition:
      *
-     * 1 voter goes to looking again and time waitForEpoch &gt; maxTimeToWaitForEpoch
+     * 1 voter goes to looking again and time waitForEpoch > maxTimeToWaitForEpoch
      *
      * Note: the voter may go to looking again in case of:
      * 1. change mind in the last minute when received a different notification
@@ -1442,10 +1446,10 @@ public class Leader extends LearnerMaster {
             if (ss.getCurrentEpoch() != -1) {
                 if (ss.isMoreRecentThan(leaderStateSummary)) {
                     throw new IOException("Follower is ahead of the leader, leader summary: "
-                                          + leaderStateSummary.getCurrentEpoch()
-                                          + " (current epoch), "
-                                          + leaderStateSummary.getLastZxid()
-                                          + " (last zxid)");
+                            + leaderStateSummary.getCurrentEpoch()
+                            + " (current epoch), "
+                            + leaderStateSummary.getLastZxid()
+                            + " (last zxid)");
                 }
                 if (ss.getLastZxid() != -1 && isParticipant(id)) {
                     electingFollowers.add(id);
@@ -1493,8 +1497,8 @@ public class Leader extends LearnerMaster {
         // Update lastCommitted and Db's zxid to a value representing the new epoch
         lastCommitted = zk.getZxid();
         LOG.info("Have quorum of supporters, sids: [{}]; starting up and setting last processed zxid: 0x{}",
-                 newLeaderProposal.ackSetsToString(),
-                 Long.toHexString(zk.getZxid()));
+                newLeaderProposal.ackSetsToString(),
+                Long.toHexString(zk.getZxid()));
 
         if (self.isReconfigEnabled()) {
             /*
@@ -1550,10 +1554,10 @@ public class Leader extends LearnerMaster {
             long currentZxid = newLeaderProposal.packet.getZxid();
             if (zxid != currentZxid) {
                 LOG.error(
-                    "NEWLEADER ACK from sid: {} is from a different epoch - current 0x{} received 0x{}",
-                    sid,
-                    Long.toHexString(currentZxid),
-                    Long.toHexString(zxid));
+                        "NEWLEADER ACK from sid: {} is from a different epoch - current 0x{} received 0x{}",
+                        sid,
+                        Long.toHexString(currentZxid),
+                        Long.toHexString(zxid));
                 return;
             }
 
@@ -1588,46 +1592,46 @@ public class Leader extends LearnerMaster {
      */
     public static String getPacketType(int packetType) {
         switch (packetType) {
-        case DIFF:
-            return "DIFF";
-        case TRUNC:
-            return "TRUNC";
-        case SNAP:
-            return "SNAP";
-        case OBSERVERINFO:
-            return "OBSERVERINFO";
-        case NEWLEADER:
-            return "NEWLEADER";
-        case FOLLOWERINFO:
-            return "FOLLOWERINFO";
-        case UPTODATE:
-            return "UPTODATE";
-        case LEADERINFO:
-            return "LEADERINFO";
-        case ACKEPOCH:
-            return "ACKEPOCH";
-        case REQUEST:
-            return "REQUEST";
-        case PROPOSAL:
-            return "PROPOSAL";
-        case ACK:
-            return "ACK";
-        case COMMIT:
-            return "COMMIT";
-        case COMMITANDACTIVATE:
-            return "COMMITANDACTIVATE";
-        case PING:
-            return "PING";
-        case REVALIDATE:
-            return "REVALIDATE";
-        case SYNC:
-            return "SYNC";
-        case INFORM:
-            return "INFORM";
-        case INFORMANDACTIVATE:
-            return "INFORMANDACTIVATE";
-        default:
-            return "UNKNOWN";
+            case DIFF:
+                return "DIFF";
+            case TRUNC:
+                return "TRUNC";
+            case SNAP:
+                return "SNAP";
+            case OBSERVERINFO:
+                return "OBSERVERINFO";
+            case NEWLEADER:
+                return "NEWLEADER";
+            case FOLLOWERINFO:
+                return "FOLLOWERINFO";
+            case UPTODATE:
+                return "UPTODATE";
+            case LEADERINFO:
+                return "LEADERINFO";
+            case ACKEPOCH:
+                return "ACKEPOCH";
+            case REQUEST:
+                return "REQUEST";
+            case PROPOSAL:
+                return "PROPOSAL";
+            case ACK:
+                return "ACK";
+            case COMMIT:
+                return "COMMIT";
+            case COMMITANDACTIVATE:
+                return "COMMITANDACTIVATE";
+            case PING:
+                return "PING";
+            case REVALIDATE:
+                return "REVALIDATE";
+            case SYNC:
+                return "SYNC";
+            case INFORM:
+                return "INFORM";
+            case INFORMANDACTIVATE:
+                return "INFORMANDACTIVATE";
+            default:
+                return "UNKNOWN";
         }
     }
 
@@ -1711,16 +1715,16 @@ public class Leader extends LearnerMaster {
                 zk.setOwner(id, learnerHandler);
             } catch (KeeperException.SessionExpiredException e) {
                 LOG.error(
-                    "Somehow session 0x{} expired right after being renewed! (impossible)",
-                    Long.toHexString(id),
-                    e);
+                        "Somehow session 0x{} expired right after being renewed! (impossible)",
+                        Long.toHexString(id),
+                        e);
             }
         }
         if (LOG.isTraceEnabled()) {
             ZooTrace.logTraceMessage(
-                LOG,
-                ZooTrace.SESSION_TRACE_MASK,
-                "Session 0x" + Long.toHexString(id) + " is valid: " + valid);
+                    LOG,
+                    ZooTrace.SESSION_TRACE_MASK,
+                    "Session 0x" + Long.toHexString(id) + " is valid: " + valid);
         }
         dos.writeBoolean(valid);
         qp.setData(bos.toByteArray());

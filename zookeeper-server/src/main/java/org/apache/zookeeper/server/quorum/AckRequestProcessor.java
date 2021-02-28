@@ -27,6 +27,8 @@ import org.slf4j.LoggerFactory;
 /**
  * This is a very simple RequestProcessor that simply forwards a request from a
  * previous stage to the leader as an ACK.
+ *
+ * 只是将前一阶段的请求作为ack发送给leader
  */
 class AckRequestProcessor implements RequestProcessor {
 

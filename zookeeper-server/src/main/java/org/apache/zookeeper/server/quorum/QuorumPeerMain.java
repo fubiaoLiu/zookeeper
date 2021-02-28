@@ -18,21 +18,13 @@
 
 package org.apache.zookeeper.server.quorum;
 
-import java.io.IOException;
-import javax.management.JMException;
-import javax.security.sasl.SaslException;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.apache.zookeeper.audit.ZKAuditProvider;
 import org.apache.zookeeper.jmx.ManagedUtil;
 import org.apache.zookeeper.metrics.MetricsProvider;
 import org.apache.zookeeper.metrics.MetricsProviderLifeCycleException;
 import org.apache.zookeeper.metrics.impl.MetricsProviderBootstrap;
-import org.apache.zookeeper.server.DatadirCleanupManager;
-import org.apache.zookeeper.server.ExitCode;
-import org.apache.zookeeper.server.ServerCnxnFactory;
-import org.apache.zookeeper.server.ServerMetrics;
-import org.apache.zookeeper.server.ZKDatabase;
-import org.apache.zookeeper.server.ZooKeeperServerMain;
+import org.apache.zookeeper.server.*;
 import org.apache.zookeeper.server.admin.AdminServer.AdminServerException;
 import org.apache.zookeeper.server.auth.ProviderRegistry;
 import org.apache.zookeeper.server.persistence.FileTxnSnapLog;
@@ -42,6 +34,10 @@ import org.apache.zookeeper.server.util.JvmPauseMonitor;
 import org.apache.zookeeper.util.ServiceUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import javax.management.JMException;
+import javax.security.sasl.SaslException;
+import java.io.IOException;
 
 /**
  *
@@ -64,7 +60,7 @@ import org.slf4j.LoggerFactory;
  * initially synchronize with a leader.</li>
  * <li>syncLimit - The maximum number of ticks that a follower will wait for a
  * message (including heartbeats) from the leader.</li>
- * <li>server.<i>id</i> - This is the host:port[:port] that the server with the
+ * <li>server.id - This is the host:port[:port] that the server with the
  * given id will use for the quorum protocol.</li>
  * </ol>
  * In addition to the config file. There is a file in the data directory called
@@ -120,19 +116,27 @@ public class QuorumPeerMain {
     }
 
     protected void initializeAndRun(String[] args) throws ConfigException, IOException, AdminServerException {
+        // 创建配置对象，用来存储解析配置信息
         QuorumPeerConfig config = new QuorumPeerConfig();
+
+        // 如果只传了一个参数，就认为是zoo.cfg配置文件，直接解析配置文件
         if (args.length == 1) {
             config.parse(args[0]);
         }
 
         // Start and schedule the the purge task
+        // 数据请求组件
+        // zk会存储事务日志、定期生成内存快照，都会产生文件，就是通过这个组件来进行清理的
         DatadirCleanupManager purgeMgr = new DatadirCleanupManager(
-            config.getDataDir(),
-            config.getDataLogDir(),
-            config.getSnapRetainCount(),
-            config.getPurgeInterval());
+                config.getDataDir(),
+                config.getDataLogDir(),
+                config.getSnapRetainCount(),
+                config.getPurgeInterval());
         purgeMgr.start();
 
+        // 如果指定了配置文件并且是分布式集群部署的，就走第一个分支启动
+        // 判断是否是分布式集群的就是看zoo.cfg文件中有没有配置server信息
+        // 否则表示单机版本，走下面的分支启动通过ZooKeeperServerMain来启动
         if (args.length == 1 && config.isDistributed()) {
             runFromConfig(config);
         } else {
@@ -153,8 +157,8 @@ public class QuorumPeerMain {
         final MetricsProvider metricsProvider;
         try {
             metricsProvider = MetricsProviderBootstrap.startMetricsProvider(
-                config.getMetricsProviderClassName(),
-                config.getMetricsProviderConfiguration());
+                    config.getMetricsProviderClassName(),
+                    config.getMetricsProviderConfiguration());
         } catch (MetricsProviderLifeCycleException error) {
             throw new IOException("Cannot boot MetricsProvider " + config.getMetricsProviderClassName(), error);
         }
@@ -165,7 +169,10 @@ public class QuorumPeerMain {
             ServerCnxnFactory secureCnxnFactory = null;
 
             if (config.getClientPortAddress() != null) {
+                // 创建ServerCnxnFactory实例对象
+                // 默认走NIOServerCnxnFactory，客户端的请求都是通过这个组件接收处理
                 cnxnFactory = ServerCnxnFactory.createFactory();
+                // 完成初始化
                 cnxnFactory.configure(config.getClientPortAddress(), config.getMaxClientCnxns(), config.getClientPortListenBacklog(), false);
             }
 
@@ -174,7 +181,10 @@ public class QuorumPeerMain {
                 secureCnxnFactory.configure(config.getSecureClientPortAddress(), config.getMaxClientCnxns(), config.getClientPortListenBacklog(), true);
             }
 
+            // 创建QuorumPeer，一个QuorumPeer就表示集群中的一个节点
+            // 这里主要就是初始化QuorumPeer线程，设置相关的参数
             quorumPeer = getQuorumPeer();
+            // 初始化FileTxnSnapLog组件
             quorumPeer.setTxnFactory(new FileTxnSnapLog(config.getDataLogDir(), config.getDataDir()));
             quorumPeer.enableLocalSessions(config.areLocalSessionsEnabled());
             quorumPeer.enableLocalSessionsUpgrading(config.isLocalSessionsUpgradingEnabled());
@@ -190,11 +200,13 @@ public class QuorumPeerMain {
             quorumPeer.setObserverMasterPort(config.getObserverMasterPort());
             quorumPeer.setConfigFileName(config.getConfigFilename());
             quorumPeer.setClientPortListenBacklog(config.getClientPortListenBacklog());
+            // 初始化ZKDatabase组件，里面包装了FileTxnSnapLog组件
             quorumPeer.setZKDatabase(new ZKDatabase(quorumPeer.getTxnFactory()));
             quorumPeer.setQuorumVerifier(config.getQuorumVerifier(), false);
             if (config.getLastSeenQuorumVerifier() != null) {
                 quorumPeer.setLastSeenQuorumVerifier(config.getLastSeenQuorumVerifier(), false);
             }
+            // 初始化数据库中的配置
             quorumPeer.initConfigInZKDatabase();
             quorumPeer.setCnxnFactory(cnxnFactory);
             quorumPeer.setSecureCnxnFactory(secureCnxnFactory);
@@ -220,14 +232,20 @@ public class QuorumPeerMain {
                 quorumPeer.setQuorumLearnerLoginContext(config.quorumLearnerLoginContext);
             }
             quorumPeer.setQuorumCnxnThreadsSize(config.quorumCnxnThreadsSize);
+            // QuorumPeer对象创建时初始化了一次，这里设置完参数后，再次初始化
             quorumPeer.initialize();
 
             if (config.jvmPauseMonitorToRun) {
                 quorumPeer.setJvmPauseMonitor(new JvmPauseMonitor(config));
             }
 
+            // 启动QuorumPeer线程，这里会先调用QuorumPeer自己的start方法，
+            // 做了一些事情之后再调用父类的start真正启动线程
+            // 后面逻辑直接进入run方法看，run方法肯定是不会退出的
+            // 如果run方法执行完毕退出，QuorumPeerMain进程就会退出
             quorumPeer.start();
             ZKAuditProvider.addZKStartStopAuditLog();
+            // 阻塞在这里等QuorumPeer线程执行完毕
             quorumPeer.join();
         } catch (InterruptedException e) {
             // warn, but generally this is ok

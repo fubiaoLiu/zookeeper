@@ -19,26 +19,16 @@
 package org.apache.zookeeper.server.quorum;
 
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
-import java.util.ArrayDeque;
-import java.util.Deque;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.zookeeper.ZooDefs.OpCode;
 import org.apache.zookeeper.common.Time;
-import org.apache.zookeeper.server.ExitCode;
-import org.apache.zookeeper.server.Request;
-import org.apache.zookeeper.server.RequestProcessor;
-import org.apache.zookeeper.server.ServerMetrics;
-import org.apache.zookeeper.server.WorkerService;
-import org.apache.zookeeper.server.ZooKeeperCriticalThread;
-import org.apache.zookeeper.server.ZooKeeperServerListener;
+import org.apache.zookeeper.server.*;
 import org.apache.zookeeper.util.ServiceUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.util.*;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * This RequestProcessor matches the incoming committed requests with the
@@ -64,6 +54,8 @@ import org.slf4j.LoggerFactory;
  *
  * Typical (default) thread counts are: on a 32 core machine, 1 commit
  * processor thread and 32 worker threads.
+ *
+ * 在经典的32核机器上，默认会有1个commit主线程、32个工作线程
  *
  * Multi-threading constraints:
  *   - Each session's requests must be processed in order.
@@ -168,28 +160,28 @@ public class CommitProcessor extends ZooKeeperCriticalThread implements RequestP
 
     protected boolean needCommit(Request request) {
         if (request.isThrottled()) {
-          return false;
+            return false;
         }
         switch (request.type) {
-        case OpCode.create:
-        case OpCode.create2:
-        case OpCode.createTTL:
-        case OpCode.createContainer:
-        case OpCode.delete:
-        case OpCode.deleteContainer:
-        case OpCode.setData:
-        case OpCode.reconfig:
-        case OpCode.multi:
-        case OpCode.setACL:
-        case OpCode.check:
-            return true;
-        case OpCode.sync:
-            return matchSyncs;
-        case OpCode.createSession:
-        case OpCode.closeSession:
-            return !request.isLocalSession();
-        default:
-            return false;
+            case OpCode.create:
+            case OpCode.create2:
+            case OpCode.createTTL:
+            case OpCode.createContainer:
+            case OpCode.delete:
+            case OpCode.deleteContainer:
+            case OpCode.setData:
+            case OpCode.reconfig:
+            case OpCode.multi:
+            case OpCode.setACL:
+            case OpCode.check:
+                return true;
+            case OpCode.sync:
+                return matchSyncs;
+            case OpCode.createSession:
+            case OpCode.closeSession:
+                return !request.isLocalSession();
+            default:
+                return false;
         }
     }
 
@@ -245,12 +237,15 @@ public class CommitProcessor extends ZooKeeperCriticalThread implements RequestP
                 Request request;
                 int readsProcessed = 0;
                 while (!stopped
-                       && requestsToProcess > 0
-                       && (maxReadBatchSize < 0 || readsProcessed <= maxReadBatchSize)
-                       && (request = queuedRequests.poll()) != null) {
+                        && requestsToProcess > 0
+                        && (maxReadBatchSize < 0 || readsProcessed <= maxReadBatchSize)
+                        // 从队列中取出请求，如果需要commit，则放入pendingRequests，否则直接交给下个processor进行处理
+                        && (request = queuedRequests.poll()) != null) {
                     requestsToProcess--;
+                    // follower接收到的sync请求需要commit，所以sync请求也会进入pendingRequests队列
                     if (needCommit(request) || pendingRequests.containsKey(request.sessionId)) {
                         // Add request to pending
+                        // 将请求添加到待处理队列，create请求需要执行commit
                         Deque<Request> requests = pendingRequests.computeIfAbsent(request.sessionId, sid -> new ArrayDeque<>());
                         requests.addLast(request);
                         ServerMetrics.getMetrics().REQUESTS_IN_SESSION_QUEUE.add(requests.size());
@@ -309,6 +304,10 @@ public class CommitProcessor extends ZooKeeperCriticalThread implements RequestP
                     while (commitIsWaiting && !stopped && commitsToProcess > 0) {
 
                         // Process committed head
+                        // 获取已经commit的请求
+                        // 如果已经commit的请求和等待队列中要commit的请求匹配上了，
+                        // 则将请求从等待队列和已提交队列中删除，表示请求已处理完毕
+                        // 然后交给下一个processor处理
                         request = committedRequests.peek();
 
                         if (request.isThrottled()) {
@@ -324,8 +323,8 @@ public class CommitProcessor extends ZooKeeperCriticalThread implements RequestP
                          * it must be a commit for a remote write.
                          */
                         if (!queuedWriteRequests.isEmpty()
-                            && queuedWriteRequests.peek().sessionId == request.sessionId
-                            && queuedWriteRequests.peek().cxid == request.cxid) {
+                                && queuedWriteRequests.peek().sessionId == request.sessionId
+                                && queuedWriteRequests.peek().cxid == request.cxid) {
                             /*
                              * Commit matches the earliest write in our write queue.
                              */
@@ -378,12 +377,13 @@ public class CommitProcessor extends ZooKeeperCriticalThread implements RequestP
                         commitsProcessed++;
 
                         // Process the write inline.
+                        // 处理写入请求，会通过FinalProcessor将请求应用到内存数据库中，然后返回响应给客户端
                         processWrite(request);
 
                         commitIsWaiting = !committedRequests.isEmpty();
                     }
                     ServerMetrics.getMetrics().WRITE_BATCH_TIME_IN_COMMIT_PROCESSOR
-                        .add(Time.currentElapsedTime() - startWriteTime);
+                            .add(Time.currentElapsedTime() - startWriteTime);
                     ServerMetrics.getMetrics().WRITES_ISSUED_IN_COMMIT_PROC.add(commitsProcessed);
 
                     /*
@@ -438,7 +438,7 @@ public class CommitProcessor extends ZooKeeperCriticalThread implements RequestP
             }
         }
         ServerMetrics.getMetrics().TIME_WAITING_EMPTY_POOL_IN_COMMIT_PROCESSOR_READ
-            .add(Time.currentElapsedTime() - startWaitTime);
+                .add(Time.currentElapsedTime() - startWaitTime);
     }
 
     @Override
@@ -450,8 +450,8 @@ public class CommitProcessor extends ZooKeeperCriticalThread implements RequestP
         initBatchSizes();
 
         LOG.info(
-            "Configuring CommitProcessor with {} worker threads.",
-            numWorkerThreads > 0 ? numWorkerThreads : "no");
+                "Configuring CommitProcessor with {} worker threads.",
+                numWorkerThreads > 0 ? numWorkerThreads : "no");
         if (workerPool == null) {
             workerPool = new WorkerService("CommitProcWork", numWorkerThreads, true);
         }
@@ -474,6 +474,7 @@ public class CommitProcessor extends ZooKeeperCriticalThread implements RequestP
         processCommitMetrics(request, true);
 
         long timeBeforeFinalProc = Time.currentElapsedTime();
+        // 最后会通过FinalProcessor将请求应用到内存数据库中，然后返回响应给客户端
         nextProcessor.processRequest(request);
         ServerMetrics.getMetrics().WRITE_FINAL_PROC_TIME.add(Time.currentElapsedTime() - timeBeforeFinalProc);
     }
@@ -488,9 +489,9 @@ public class CommitProcessor extends ZooKeeperCriticalThread implements RequestP
         }
 
         LOG.info
-            ("Configuring CommitProcessor with readBatchSize {} commitBatchSize {}",
-             maxReadBatchSize,
-             maxCommitBatchSize);
+                ("Configuring CommitProcessor with readBatchSize {} commitBatchSize {}",
+                        maxReadBatchSize,
+                        maxCommitBatchSize);
     }
 
     private static void processCommitMetrics(Request request, boolean isWrite) {
@@ -503,12 +504,12 @@ public class CommitProcessor extends ZooKeeperCriticalThread implements RequestP
             } else if (request.commitRecvTime != -1) {
                 // Writes issued by other servers.
                 ServerMetrics.getMetrics().SERVER_WRITE_COMMITTED_TIME
-                    .add(Time.currentElapsedTime() - request.commitRecvTime);
+                        .add(Time.currentElapsedTime() - request.commitRecvTime);
             }
         } else {
             if (request.commitProcQueueStartTime != -1) {
                 ServerMetrics.getMetrics().READ_COMMITPROC_TIME
-                    .add(Time.currentElapsedTime() - request.commitProcQueueStartTime);
+                        .add(Time.currentElapsedTime() - request.commitProcQueueStartTime);
             }
         }
     }
@@ -561,10 +562,10 @@ public class CommitProcessor extends ZooKeeperCriticalThread implements RequestP
                 nextProcessor.processRequest(request);
                 if (needCommit(request)) {
                     ServerMetrics.getMetrics().WRITE_FINAL_PROC_TIME
-                        .add(Time.currentElapsedTime() - timeBeforeFinalProc);
+                            .add(Time.currentElapsedTime() - timeBeforeFinalProc);
                 } else {
                     ServerMetrics.getMetrics().READ_FINAL_PROC_TIME
-                        .add(Time.currentElapsedTime() - timeBeforeFinalProc);
+                            .add(Time.currentElapsedTime() - timeBeforeFinalProc);
                 }
 
             } finally {
@@ -608,6 +609,7 @@ public class CommitProcessor extends ZooKeeperCriticalThread implements RequestP
         request.commitProcQueueStartTime = Time.currentElapsedTime();
         queuedRequests.add(request);
         // If the request will block, add it to the queue of blocking requests
+        // sync请求默认需要commit
         if (needCommit(request)) {
             queuedWriteRequests.add(request);
             numWriteQueuedRequests.incrementAndGet();

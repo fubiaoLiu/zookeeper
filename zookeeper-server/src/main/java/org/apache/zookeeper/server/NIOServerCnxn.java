@@ -165,14 +165,15 @@ public class NIOServerCnxn extends ServerCnxn {
         setStale();
         ServerMetrics.getMetrics().CONNECTION_DROP_COUNT.add(1);
         throw new EndOfStreamException("Unable to read additional data from client,"
-                                       + " it probably closed the socket:"
-                                       + " address = " + sock.socket().getRemoteSocketAddress() + ","
-                                       + " session = 0x" + Long.toHexString(sessionId),
-                                       DisconnectReason.UNABLE_TO_READ_FROM_CLIENT);
+                + " it probably closed the socket:"
+                + " address = " + sock.socket().getRemoteSocketAddress() + ","
+                + " session = 0x" + Long.toHexString(sessionId),
+                DisconnectReason.UNABLE_TO_READ_FROM_CLIENT);
     }
 
     /** Read the request payload (everything following the length prefix) */
     private void readPayload() throws IOException, InterruptedException, ClientCnxnLimitException {
+        // 如果remaining不为0，表示上次没有读取完毕，接着继续读取，解决拆包问题
         if (incomingBuffer.remaining() != 0) { // have we read length bytes?
             int rc = sock.read(incomingBuffer); // sock is non-blocking, so ok
             if (rc < 0) {
@@ -180,9 +181,12 @@ public class NIOServerCnxn extends ServerCnxn {
             }
         }
 
+        // 如果remaining为0，表示一个请求已经读取完毕，接着从buffer中取出数据，处理请求
+        // 处理完请求后，将incomingBuffer重新替换为lenBuffer
         if (incomingBuffer.remaining() == 0) { // have we read length bytes?
             incomingBuffer.flip();
             packetReceived(4 + incomingBuffer.remaining());
+            // 第一个一定是Connect请求，Connect请求处理完成后会设置initialized标志位为true
             if (!initialized) {
                 readConnectRequest();
             } else {
@@ -328,18 +332,33 @@ public class NIOServerCnxn extends ServerCnxn {
                 return;
             }
             if (k.isReadable()) {
+                // 先读取4个字节，int类型的数字，表示长度
+                // 如果出现了拆包问题，这里会接着之前没读取完的继续读取
+                //  如果是len没读取完，会继续读取直到读取到了4个字节
+                //  如果是请求内容没读取完，会继续读取直到读取完已知长度的请求
                 int rc = sock.read(incomingBuffer);
                 if (rc < 0) {
                     handleFailedRead();
                 }
+                // 如果读取了完整的4个字节，才继续往下读，否则下次接着继续读取，直到读取到完整的4个字节
+                // 解决接收端的拆包问题
                 if (incomingBuffer.remaining() == 0) {
                     boolean isPayload;
+                    /**
+                     * incomingBuffer等于lenBuffer，表示读取的是长度，否则表示读取的是内容
+                     * 如果读取的是长度，后面{@link #readPayload()}方法中会再次读取内容
+                     * 读取了内容后，会从incomingBuffer中读取数据，进行处理
+                     */
                     if (incomingBuffer == lenBuffer) { // start of next request
                         incomingBuffer.flip();
+                        // 根据读取的长度创建分配新的ByteBuffer给incomingBuffer，请求前面使用固定字节记录长度解决粘包问题
+                        // 然后清空incomingBuffer
+                        // 此时isPayload为true，表示后面是内容，继续读取请求内容
                         isPayload = readLength(k);
                         incomingBuffer.clear();
                     } else {
                         // continuation
+                        // 如果incomingBuffer不等于lenBuffer，表示刚刚读取的是请求内容，设置isPayload为true
                         isPayload = true;
                     }
                     if (isPayload) { // not the case for 4letterword
@@ -366,6 +385,7 @@ public class NIOServerCnxn extends ServerCnxn {
             close(DisconnectReason.CANCELLED_KEY_EXCEPTION);
         } catch (CloseRequestException e) {
             // expecting close to log session closure
+            // 关闭会话
             close();
         } catch (EndOfStreamException e) {
             LOG.warn("Unexpected exception", e);
@@ -383,6 +403,7 @@ public class NIOServerCnxn extends ServerCnxn {
     }
 
     protected void readRequest() throws IOException {
+        // 处理接收到的请求packet
         zkServer.processPacket(this, incomingBuffer);
     }
 
@@ -504,9 +525,9 @@ public class NIOServerCnxn extends ServerCnxn {
         if (!FourLetterCommands.isEnabled(cmd)) {
             LOG.debug("Command {} is not executed because it is not in the whitelist.", cmd);
             NopCommand nopCmd = new NopCommand(
-                pwriter,
-                this,
-                cmd + " is not executed because it is not in the whitelist.");
+                    pwriter,
+                    this,
+                    cmd + " is not executed because it is not in the whitelist.");
             nopCmd.start();
             return true;
         }
@@ -589,6 +610,7 @@ public class NIOServerCnxn extends ServerCnxn {
             return;
         }
 
+        // 在这里会删除该客户端注册的watcher
         if (zkServer != null) {
             zkServer.removeCnxn(this);
         }
@@ -614,12 +636,12 @@ public class NIOServerCnxn extends ServerCnxn {
         }
 
         String logMsg = String.format(
-            "Closed socket connection for client %s %s",
-            sock.socket().getRemoteSocketAddress(),
-            sessionId != 0
-                ? "which had sessionid 0x" + Long.toHexString(sessionId)
-                : "(no session established for client)"
-            );
+                "Closed socket connection for client %s %s",
+                sock.socket().getRemoteSocketAddress(),
+                sessionId != 0
+                        ? "which had sessionid 0x" + Long.toHexString(sessionId)
+                        : "(no session established for client)"
+        );
         LOG.debug(logMsg);
 
         closeSock(sock);
@@ -690,9 +712,9 @@ public class NIOServerCnxn extends ServerCnxn {
         ReplyHeader h = new ReplyHeader(ClientCnxn.NOTIFICATION_XID, -1L, 0);
         if (LOG.isTraceEnabled()) {
             ZooTrace.logTraceMessage(
-                LOG,
-                ZooTrace.EVENT_DELIVERY_TRACE_MASK,
-                "Deliver event " + event + " to 0x" + Long.toHexString(this.sessionId) + " through " + this);
+                    LOG,
+                    ZooTrace.EVENT_DELIVERY_TRACE_MASK,
+                    "Deliver event " + event + " to 0x" + Long.toHexString(this.sessionId) + " through " + this);
         }
 
         // Convert WatchedEvent to a type that can be sent over the wire
@@ -701,6 +723,7 @@ public class NIOServerCnxn extends ServerCnxn {
         // The last parameter OpCode here is used to select the response cache.
         // Passing OpCode.error (with a value of -1) means we don't care, as we don't need
         // response cache on delivering watcher events.
+        // 将watcher监听事件作为notification请求发送出去
         int responseSize = sendResponse(h, e, "notification", null, null, ZooDefs.OpCode.error);
         ServerMetrics.getMetrics().WATCH_BYTES.add(responseSize);
     }

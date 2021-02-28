@@ -18,21 +18,18 @@
 
 package org.apache.zookeeper.server;
 
-import java.io.File;
-import java.io.FileFilter;
-import java.io.IOException;
-import java.text.DateFormat;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.apache.zookeeper.server.persistence.FileTxnSnapLog;
 import org.apache.zookeeper.server.persistence.Util;
 import org.apache.zookeeper.util.ServiceUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.io.FileFilter;
+import java.io.IOException;
+import java.text.DateFormat;
+import java.util.*;
 
 /**
  * this class is used to clean up the
@@ -55,7 +52,7 @@ public class PurgeTxnLog {
         System.out.println("\tdataLogDir -- path to the txn log directory");
         System.out.println("\tsnapDir -- path to the snapshot directory");
         System.out.println("\tcount -- the number of old snaps/logs you want "
-                           + "to keep, value should be greater than or equal to 3");
+                + "to keep, value should be greater than or equal to 3");
     }
 
     private static final String PREFIX_SNAPSHOT = "snapshot";
@@ -79,6 +76,7 @@ public class PurgeTxnLog {
 
         FileTxnSnapLog txnLog = new FileTxnSnapLog(dataDir, snapDir);
 
+        // 获取有效的（需要保留的）快照文件
         List<File> snaps = txnLog.findNValidSnapshots(num);
         int numSnaps = snaps.size();
         if (numSnaps > 0) {
@@ -109,6 +107,7 @@ public class PurgeTxnLog {
          * recoverability of all snapshots being retained.  We determine that log file here by
          * calling txnLog.getSnapshotLogs().
          */
+        // 要保留的快照文件
         final Set<File> retainedTxnLogs = new HashSet<File>();
         retainedTxnLogs.addAll(Arrays.asList(txnLog.getSnapshotLogs(leastZxidToBeRetain)));
 
@@ -135,6 +134,7 @@ public class PurgeTxnLog {
 
         }
         // add all non-excluded log files
+        // 添加所有以log.开头并且日志zxid小于指定值的日志文件
         File[] logs = txnLog.getDataDir().listFiles(new MyFileFilter(PREFIX_LOG));
         List<File> files = new ArrayList<>();
         if (logs != null) {
@@ -142,6 +142,7 @@ public class PurgeTxnLog {
         }
 
         // add all non-excluded snapshot files to the deletion list
+        // 添加所有以snapshot.开头、不需要保留并且日志zxid小于指定值的快照文件
         File[] snapshots = txnLog.getSnapDir().listFiles(new MyFileFilter(PREFIX_SNAPSHOT));
         if (snapshots != null) {
             files.addAll(Arrays.asList(snapshots));
@@ -150,9 +151,9 @@ public class PurgeTxnLog {
         // remove the old files
         for (File f : files) {
             final String msg = String.format(
-                "Removing file: %s\t%s",
-                DateFormat.getDateTimeInstance().format(f.lastModified()),
-                f.getPath());
+                    "Removing file: %s\t%s",
+                    DateFormat.getDateTimeInstance().format(f.lastModified()),
+                    f.getPath());
 
             LOG.info(msg);
             System.out.println(msg);
@@ -168,7 +169,8 @@ public class PurgeTxnLog {
      * @param args dataLogDir [snapDir] -n count
      * dataLogDir -- path to the txn log directory
      * snapDir -- path to the snapshot directory
-     * count -- the number of old snaps/logs you want to keep, value should be greater than or equal to 3<br>
+     * count -- the number of old snaps/logs you want to keep, value should be greater than or equal to 3
+
      */
     public static void main(String[] args) throws IOException {
         if (args.length < 3 || args.length > 4) {

@@ -18,13 +18,6 @@
 
 package org.apache.zookeeper.server.watch;
 
-import java.io.PrintWriter;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.Map;
-import java.util.Map.Entry;
-import java.util.Set;
 import org.apache.zookeeper.WatchedEvent;
 import org.apache.zookeeper.Watcher;
 import org.apache.zookeeper.Watcher.Event.EventType;
@@ -35,6 +28,10 @@ import org.apache.zookeeper.server.ZooTrace;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.PrintWriter;
+import java.util.*;
+import java.util.Map.Entry;
+
 /**
  * This class manages watches. It allows watches to be associated with a string
  * and removes watchers and their watches in addition to managing triggers.
@@ -43,8 +40,16 @@ public class WatchManager implements IWatchManager {
 
     private static final Logger LOG = LoggerFactory.getLogger(WatchManager.class);
 
+    /**
+     * 每个path对应了一个set，维护了path下注册的多个watcher，这里的watcher其实是客户端连接
+     */
     private final Map<String, Set<Watcher>> watchTable = new HashMap<>();
 
+    /**
+     * 每个watcher对应一个set，维护了该客户端监听的多个path
+     * 这里的watcher就是客户端连接，代表的就是一个客户端
+     * 如果客户端session过期了，就可以根据这个数据结构，移除掉他注册的所有watcher
+     */
     private final Map<Watcher, Set<String>> watch2Paths = new HashMap<>();
 
     private final WatcherModeManager watcherModeManager = new WatcherModeManager();
@@ -123,13 +128,16 @@ public class WatchManager implements IWatchManager {
     public WatcherOrBitSet triggerWatch(String path, EventType type, WatcherOrBitSet supress) {
         WatchedEvent e = new WatchedEvent(type, KeeperState.SyncConnected, path);
         Set<Watcher> watchers = new HashSet<>();
+        // 获取要通知的path
         PathParentIterator pathParentIterator = getPathParentIterator(path);
         synchronized (this) {
             for (String localPath : pathParentIterator.asIterable()) {
+                // 获取path对应的watcher
                 Set<Watcher> thisWatchers = watchTable.get(localPath);
                 if (thisWatchers == null || thisWatchers.isEmpty()) {
                     continue;
                 }
+                // 获取需要通知的watcher
                 Iterator<Watcher> iterator = thisWatchers.iterator();
                 while (iterator.hasNext()) {
                     Watcher watcher = iterator.next();
@@ -161,13 +169,17 @@ public class WatchManager implements IWatchManager {
             return null;
         }
 
+        // 处理watcher
         for (Watcher w : watchers) {
             if (supress != null && supress.contains(w)) {
                 continue;
             }
+            // 这里会调用到NIOServerCnxn中，因为注册watcher的时候，注册的就是客户端连接
+            // 这里直接将watcher事件封装为notification请求通过客户端连接发送出去
             w.process(e);
         }
 
+        // 更新统计指标
         switch (type) {
             case NodeCreated:
                 ServerMetrics.getMetrics().NODE_CREATED_WATCHER.add(watchers.size());

@@ -18,17 +18,17 @@
 
 package org.apache.zookeeper.server.persistence;
 
-import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
-import java.io.Closeable;
-import java.io.EOFException;
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
-import java.io.FilterInputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.RandomAccessFile;
+import org.apache.jute.*;
+import org.apache.zookeeper.server.ServerMetrics;
+import org.apache.zookeeper.server.ServerStats;
+import org.apache.zookeeper.server.TxnLogEntry;
+import org.apache.zookeeper.server.util.SerializeUtils;
+import org.apache.zookeeper.txn.TxnDigest;
+import org.apache.zookeeper.txn.TxnHeader;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.*;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.util.ArrayDeque;
@@ -38,19 +38,6 @@ import java.util.Queue;
 import java.util.concurrent.TimeUnit;
 import java.util.zip.Adler32;
 import java.util.zip.Checksum;
-import org.apache.jute.BinaryInputArchive;
-import org.apache.jute.BinaryOutputArchive;
-import org.apache.jute.InputArchive;
-import org.apache.jute.OutputArchive;
-import org.apache.jute.Record;
-import org.apache.zookeeper.server.ServerMetrics;
-import org.apache.zookeeper.server.ServerStats;
-import org.apache.zookeeper.server.TxnLogEntry;
-import org.apache.zookeeper.server.util.SerializeUtils;
-import org.apache.zookeeper.txn.TxnDigest;
-import org.apache.zookeeper.txn.TxnHeader;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * This class implements the TxnLog interface. It provides api's
@@ -263,7 +250,7 @@ public class FileTxnLog implements TxnLog, Closeable {
      * returns true iff something appended, otw false
      */
     public synchronized boolean append(TxnHeader hdr, Record txn) throws IOException {
-              return append(hdr, txn, null);
+        return append(hdr, txn, null);
     }
 
     @Override
@@ -273,10 +260,10 @@ public class FileTxnLog implements TxnLog, Closeable {
         }
         if (hdr.getZxid() <= lastZxidSeen) {
             LOG.warn(
-                "Current zxid {} is <= {} for {}",
-                hdr.getZxid(),
-                lastZxidSeen,
-                hdr.getType());
+                    "Current zxid {} is <= {} for {}",
+                    hdr.getZxid(),
+                    lastZxidSeen,
+                    hdr.getType());
         } else {
             lastZxidSeen = hdr.getZxid();
         }
@@ -299,8 +286,10 @@ public class FileTxnLog implements TxnLog, Closeable {
         if (buf == null || buf.length == 0) {
             throw new IOException("Faulty serialization for header " + "and txn");
         }
+        // 计算crc校验和
         Checksum crc = makeChecksumAlgorithm();
         crc.update(buf, 0, buf.length);
+        // 先写入crc、再写入记录
         oa.writeLong(crc.getValue(), "txnEntryCRC");
         Util.writeTxnBytes(oa, buf);
 
@@ -391,11 +380,11 @@ public class FileTxnLog implements TxnLog, Closeable {
                     }
 
                     LOG.warn(
-                        "fsync-ing the write ahead log in {} took {}ms which will adversely effect operation latency."
-                            + "File size is {} bytes. See the ZooKeeper troubleshooting guide",
-                        Thread.currentThread().getName(),
-                        syncElapsedMS,
-                        channel.size());
+                            "fsync-ing the write ahead log in {} took {}ms which will adversely effect operation latency."
+                                    + "File size is {} bytes. See the ZooKeeper troubleshooting guide",
+                            Thread.currentThread().getName(),
+                            syncElapsedMS,
+                            channel.size());
                 }
 
                 ServerMetrics.getMetrics().FSYNC_TIME.add(syncElapsedMS);
@@ -457,8 +446,8 @@ public class FileTxnLog implements TxnLog, Closeable {
             PositionInputStream input = itr.inputStream;
             if (input == null) {
                 throw new IOException("No log files found to truncate! This could "
-                                      + "happen if you still have snapshots from an old setup or "
-                                      + "log files were deleted accidentally or dataLogDir was changed in zoo.cfg.");
+                        + "happen if you still have snapshots from an old setup or "
+                        + "log files were deleted accidentally or dataLogDir was changed in zoo.cfg.");
             }
             long pos = input.getPosition();
             // now, truncate at the current position
@@ -653,9 +642,9 @@ public class FileTxnLog implements TxnLog, Closeable {
         void init() throws IOException {
             storedFiles = new ArrayList<>();
             List<File> files = Util.sortDataDir(
-                FileTxnLog.getLogFiles(logDir.listFiles(), 0),
-                LOG_FILE_PREFIX,
-                false);
+                    FileTxnLog.getLogFiles(logDir.listFiles(), 0),
+                    LOG_FILE_PREFIX,
+                    false);
             for (File f : files) {
                 if (Util.getZxidFromName(f.getName(), LOG_FILE_PREFIX) >= zxid) {
                     storedFiles.add(f);
@@ -706,8 +695,8 @@ public class FileTxnLog implements TxnLog, Closeable {
             header.deserialize(ia, "fileheader");
             if (header.getMagic() != FileTxnLog.TXNLOG_MAGIC) {
                 throw new IOException("Transaction log: " + this.logFile
-                                      + " has invalid magic number "
-                                      + header.getMagic() + " != " + FileTxnLog.TXNLOG_MAGIC);
+                        + " has invalid magic number "
+                        + header.getMagic() + " != " + FileTxnLog.TXNLOG_MAGIC);
             }
         }
 

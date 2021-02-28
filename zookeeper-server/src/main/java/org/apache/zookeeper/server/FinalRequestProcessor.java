@@ -94,6 +94,9 @@ import org.slf4j.LoggerFactory;
  *
  * This RequestProcessor counts on ZooKeeperServer to populate the
  * outstandingRequests member of ZooKeeperServer.
+ *
+ * 该处理器实际上作用与请求关联的任何事务并且为查询提供服务。
+ * 它始终位于RequestProcessor链的末尾（因此叫Final），它没有nextProcessor成员变量
  */
 public class FinalRequestProcessor implements RequestProcessor {
 
@@ -109,6 +112,7 @@ public class FinalRequestProcessor implements RequestProcessor {
     }
 
     private ProcessTxnResult applyRequest(Request request) {
+        // 交给ZooKeeperServer处理
         ProcessTxnResult rc = zks.processTxn(request);
 
         // ZOOKEEPER-558:
@@ -120,8 +124,9 @@ public class FinalRequestProcessor implements RequestProcessor {
             // We need to check if we can close the session id.
             // Sometimes the corresponding ServerCnxnFactory could be null because
             // we are just playing diffs from the leader.
+            // 关闭session，关闭连接
             if (closeSession(zks.serverCnxnFactory, request.sessionId)
-                || closeSession(zks.secureServerCnxnFactory, request.sessionId)) {
+                    || closeSession(zks.secureServerCnxnFactory, request.sessionId)) {
                 return rc;
             }
         }
@@ -156,7 +161,9 @@ public class FinalRequestProcessor implements RequestProcessor {
         }
         ProcessTxnResult rc = null;
         if (!request.isThrottled()) {
-          rc = applyRequest(request);
+            // 如果请求没有被限流，将请求应用到内存数据库
+            // 然后触发对应的watcher
+            rc = applyRequest(request);
         }
         if (request.cnxn == null) {
             return;
@@ -206,373 +213,380 @@ public class FinalRequestProcessor implements RequestProcessor {
             }
 
             if (request.isThrottled()) {
-              throw KeeperException.create(Code.THROTTLEDOP);
+                throw KeeperException.create(Code.THROTTLEDOP);
             }
 
             AuditHelper.addAuditLog(request, rc);
 
             switch (request.type) {
-            case OpCode.ping: {
-                lastOp = "PING";
-                updateStats(request, lastOp, lastZxid);
+                case OpCode.ping: {
+                    // ping请求最终会走到这里
+                    lastOp = "PING";
+                    // 更新统计信息
+                    updateStats(request, lastOp, lastZxid);
 
-                responseSize = cnxn.sendResponse(new ReplyHeader(ClientCnxn.PING_XID, lastZxid, 0), null, "response");
-                return;
-            }
-            case OpCode.createSession: {
-                lastOp = "SESS";
-                updateStats(request, lastOp, lastZxid);
+                    // 返回ping请求对应response，这里面会更新SelectionKey的interestOps
+                    // 会将SelectionKey放入SelectorThread的updateQueue队列，
+                    responseSize = cnxn.sendResponse(new ReplyHeader(ClientCnxn.PING_XID, lastZxid, 0), null, "response");
+                    return;
+                }
+                case OpCode.createSession: {
+                    lastOp = "SESS";
+                    updateStats(request, lastOp, lastZxid);
 
-                zks.finishSessionInit(request.cnxn, true);
-                return;
-            }
-            case OpCode.multi: {
-                lastOp = "MULT";
-                rsp = new MultiResponse();
+                    zks.finishSessionInit(request.cnxn, true);
+                    return;
+                }
+                case OpCode.multi: {
+                    lastOp = "MULT";
+                    rsp = new MultiResponse();
 
-                for (ProcessTxnResult subTxnResult : rc.multiResult) {
+                    for (ProcessTxnResult subTxnResult : rc.multiResult) {
 
+                        OpResult subResult;
+
+                        switch (subTxnResult.type) {
+                            case OpCode.check:
+                                subResult = new CheckResult();
+                                break;
+                            case OpCode.create:
+                                subResult = new CreateResult(subTxnResult.path);
+                                break;
+                            case OpCode.create2:
+                            case OpCode.createTTL:
+                            case OpCode.createContainer:
+                                subResult = new CreateResult(subTxnResult.path, subTxnResult.stat);
+                                break;
+                            case OpCode.delete:
+                            case OpCode.deleteContainer:
+                                subResult = new DeleteResult();
+                                break;
+                            case OpCode.setData:
+                                subResult = new SetDataResult(subTxnResult.stat);
+                                break;
+                            case OpCode.error:
+                                subResult = new ErrorResult(subTxnResult.err);
+                                if (subTxnResult.err == Code.SESSIONMOVED.intValue()) {
+                                    throw new SessionMovedException();
+                                }
+                                break;
+                            default:
+                                throw new IOException("Invalid type of op");
+                        }
+
+                        ((MultiResponse) rsp).add(subResult);
+                    }
+
+                    break;
+                }
+                case OpCode.multiRead: {
+                    lastOp = "MLTR";
+                    MultiOperationRecord multiReadRecord = new MultiOperationRecord();
+                    ByteBufferInputStream.byteBuffer2Record(request.request, multiReadRecord);
+                    rsp = new MultiResponse();
                     OpResult subResult;
-
-                    switch (subTxnResult.type) {
-                    case OpCode.check:
-                        subResult = new CheckResult();
-                        break;
-                    case OpCode.create:
-                        subResult = new CreateResult(subTxnResult.path);
-                        break;
-                    case OpCode.create2:
-                    case OpCode.createTTL:
-                    case OpCode.createContainer:
-                        subResult = new CreateResult(subTxnResult.path, subTxnResult.stat);
-                        break;
-                    case OpCode.delete:
-                    case OpCode.deleteContainer:
-                        subResult = new DeleteResult();
-                        break;
-                    case OpCode.setData:
-                        subResult = new SetDataResult(subTxnResult.stat);
-                        break;
-                    case OpCode.error:
-                        subResult = new ErrorResult(subTxnResult.err);
-                        if (subTxnResult.err == Code.SESSIONMOVED.intValue()) {
-                            throw new SessionMovedException();
+                    for (Op readOp : multiReadRecord) {
+                        try {
+                            Record rec;
+                            switch (readOp.getType()) {
+                                case OpCode.getChildren:
+                                    rec = handleGetChildrenRequest(readOp.toRequestRecord(), cnxn, request.authInfo);
+                                    subResult = new GetChildrenResult(((GetChildrenResponse) rec).getChildren());
+                                    break;
+                                case OpCode.getData:
+                                    rec = handleGetDataRequest(readOp.toRequestRecord(), cnxn, request.authInfo);
+                                    GetDataResponse gdr = (GetDataResponse) rec;
+                                    subResult = new GetDataResult(gdr.getData(), gdr.getStat());
+                                    break;
+                                default:
+                                    throw new IOException("Invalid type of readOp");
+                            }
+                        } catch (KeeperException e) {
+                            subResult = new ErrorResult(e.code().intValue());
                         }
-                        break;
-                    default:
-                        throw new IOException("Invalid type of op");
+                        ((MultiResponse) rsp).add(subResult);
                     }
-
-                    ((MultiResponse) rsp).add(subResult);
+                    break;
                 }
-
-                break;
-            }
-            case OpCode.multiRead: {
-                lastOp = "MLTR";
-                MultiOperationRecord multiReadRecord = new MultiOperationRecord();
-                ByteBufferInputStream.byteBuffer2Record(request.request, multiReadRecord);
-                rsp = new MultiResponse();
-                OpResult subResult;
-                for (Op readOp : multiReadRecord) {
-                    try {
-                        Record rec;
-                        switch (readOp.getType()) {
-                        case OpCode.getChildren:
-                            rec = handleGetChildrenRequest(readOp.toRequestRecord(), cnxn, request.authInfo);
-                            subResult = new GetChildrenResult(((GetChildrenResponse) rec).getChildren());
-                            break;
-                        case OpCode.getData:
-                            rec = handleGetDataRequest(readOp.toRequestRecord(), cnxn, request.authInfo);
-                            GetDataResponse gdr = (GetDataResponse) rec;
-                            subResult = new GetDataResult(gdr.getData(), gdr.getStat());
-                            break;
-                        default:
-                            throw new IOException("Invalid type of readOp");
-                        }
-                    } catch (KeeperException e) {
-                        subResult = new ErrorResult(e.code().intValue());
+                case OpCode.create: {
+                    lastOp = "CREA";
+                    rsp = new CreateResponse(rc.path);
+                    err = Code.get(rc.err);
+                    requestPathMetricsCollector.registerRequest(request.type, rc.path);
+                    break;
+                }
+                case OpCode.create2:
+                case OpCode.createTTL:
+                case OpCode.createContainer: {
+                    lastOp = "CREA";
+                    rsp = new Create2Response(rc.path, rc.stat);
+                    err = Code.get(rc.err);
+                    requestPathMetricsCollector.registerRequest(request.type, rc.path);
+                    break;
+                }
+                case OpCode.delete:
+                case OpCode.deleteContainer: {
+                    lastOp = "DELE";
+                    err = Code.get(rc.err);
+                    requestPathMetricsCollector.registerRequest(request.type, rc.path);
+                    break;
+                }
+                case OpCode.setData: {
+                    lastOp = "SETD";
+                    rsp = new SetDataResponse(rc.stat);
+                    err = Code.get(rc.err);
+                    requestPathMetricsCollector.registerRequest(request.type, rc.path);
+                    break;
+                }
+                case OpCode.reconfig: {
+                    lastOp = "RECO";
+                    rsp = new GetDataResponse(
+                            ((QuorumZooKeeperServer) zks).self.getQuorumVerifier().toString().getBytes(UTF_8),
+                            rc.stat);
+                    err = Code.get(rc.err);
+                    break;
+                }
+                case OpCode.setACL: {
+                    lastOp = "SETA";
+                    rsp = new SetACLResponse(rc.stat);
+                    err = Code.get(rc.err);
+                    requestPathMetricsCollector.registerRequest(request.type, rc.path);
+                    break;
+                }
+                case OpCode.closeSession: {
+                    lastOp = "CLOS";
+                    err = Code.get(rc.err);
+                    break;
+                }
+                case OpCode.sync: {
+                    lastOp = "SYNC";
+                    SyncRequest syncRequest = new SyncRequest();
+                    ByteBufferInputStream.byteBuffer2Record(request.request, syncRequest);
+                    rsp = new SyncResponse(syncRequest.getPath());
+                    requestPathMetricsCollector.registerRequest(request.type, syncRequest.getPath());
+                    break;
+                }
+                case OpCode.check: {
+                    lastOp = "CHEC";
+                    rsp = new SetDataResponse(rc.stat);
+                    err = Code.get(rc.err);
+                    break;
+                }
+                case OpCode.exists: {
+                    lastOp = "EXIS";
+                    // TODO we need to figure out the security requirement for this!
+                    ExistsRequest existsRequest = new ExistsRequest();
+                    ByteBufferInputStream.byteBuffer2Record(request.request, existsRequest);
+                    path = existsRequest.getPath();
+                    if (path.indexOf('\0') != -1) {
+                        throw new KeeperException.BadArgumentsException();
                     }
-                    ((MultiResponse) rsp).add(subResult);
+                    // 如果注册了watcher，则将请求对应的socket连接ServerCnxn放进去
+                    // 这里的ServerCnxn实现了Watcher接口，设计的有点乱
+                    // 意思就是将注册watcher对应的客户端连接放进去，后续如果有事件发生，直接往这个连接发送event事件请求即可
+                    Stat stat = zks.getZKDatabase().statNode(path, existsRequest.getWatch() ? cnxn : null);
+                    rsp = new ExistsResponse(stat);
+                    requestPathMetricsCollector.registerRequest(request.type, path);
+                    break;
                 }
-                break;
-            }
-            case OpCode.create: {
-                lastOp = "CREA";
-                rsp = new CreateResponse(rc.path);
-                err = Code.get(rc.err);
-                requestPathMetricsCollector.registerRequest(request.type, rc.path);
-                break;
-            }
-            case OpCode.create2:
-            case OpCode.createTTL:
-            case OpCode.createContainer: {
-                lastOp = "CREA";
-                rsp = new Create2Response(rc.path, rc.stat);
-                err = Code.get(rc.err);
-                requestPathMetricsCollector.registerRequest(request.type, rc.path);
-                break;
-            }
-            case OpCode.delete:
-            case OpCode.deleteContainer: {
-                lastOp = "DELE";
-                err = Code.get(rc.err);
-                requestPathMetricsCollector.registerRequest(request.type, rc.path);
-                break;
-            }
-            case OpCode.setData: {
-                lastOp = "SETD";
-                rsp = new SetDataResponse(rc.stat);
-                err = Code.get(rc.err);
-                requestPathMetricsCollector.registerRequest(request.type, rc.path);
-                break;
-            }
-            case OpCode.reconfig: {
-                lastOp = "RECO";
-                rsp = new GetDataResponse(
-                    ((QuorumZooKeeperServer) zks).self.getQuorumVerifier().toString().getBytes(UTF_8),
-                    rc.stat);
-                err = Code.get(rc.err);
-                break;
-            }
-            case OpCode.setACL: {
-                lastOp = "SETA";
-                rsp = new SetACLResponse(rc.stat);
-                err = Code.get(rc.err);
-                requestPathMetricsCollector.registerRequest(request.type, rc.path);
-                break;
-            }
-            case OpCode.closeSession: {
-                lastOp = "CLOS";
-                err = Code.get(rc.err);
-                break;
-            }
-            case OpCode.sync: {
-                lastOp = "SYNC";
-                SyncRequest syncRequest = new SyncRequest();
-                ByteBufferInputStream.byteBuffer2Record(request.request, syncRequest);
-                rsp = new SyncResponse(syncRequest.getPath());
-                requestPathMetricsCollector.registerRequest(request.type, syncRequest.getPath());
-                break;
-            }
-            case OpCode.check: {
-                lastOp = "CHEC";
-                rsp = new SetDataResponse(rc.stat);
-                err = Code.get(rc.err);
-                break;
-            }
-            case OpCode.exists: {
-                lastOp = "EXIS";
-                // TODO we need to figure out the security requirement for this!
-                ExistsRequest existsRequest = new ExistsRequest();
-                ByteBufferInputStream.byteBuffer2Record(request.request, existsRequest);
-                path = existsRequest.getPath();
-                if (path.indexOf('\0') != -1) {
-                    throw new KeeperException.BadArgumentsException();
+                case OpCode.getData: {
+                    lastOp = "GETD";
+                    GetDataRequest getDataRequest = new GetDataRequest();
+                    ByteBufferInputStream.byteBuffer2Record(request.request, getDataRequest);
+                    path = getDataRequest.getPath();
+                    rsp = handleGetDataRequest(getDataRequest, cnxn, request.authInfo);
+                    requestPathMetricsCollector.registerRequest(request.type, path);
+                    break;
                 }
-                Stat stat = zks.getZKDatabase().statNode(path, existsRequest.getWatch() ? cnxn : null);
-                rsp = new ExistsResponse(stat);
-                requestPathMetricsCollector.registerRequest(request.type, path);
-                break;
-            }
-            case OpCode.getData: {
-                lastOp = "GETD";
-                GetDataRequest getDataRequest = new GetDataRequest();
-                ByteBufferInputStream.byteBuffer2Record(request.request, getDataRequest);
-                path = getDataRequest.getPath();
-                rsp = handleGetDataRequest(getDataRequest, cnxn, request.authInfo);
-                requestPathMetricsCollector.registerRequest(request.type, path);
-                break;
-            }
-            case OpCode.setWatches: {
-                lastOp = "SETW";
-                SetWatches setWatches = new SetWatches();
-                // TODO we really should not need this
-                request.request.rewind();
-                ByteBufferInputStream.byteBuffer2Record(request.request, setWatches);
-                long relativeZxid = setWatches.getRelativeZxid();
-                zks.getZKDatabase()
-                   .setWatches(
-                       relativeZxid,
-                       setWatches.getDataWatches(),
-                       setWatches.getExistWatches(),
-                       setWatches.getChildWatches(),
-                       Collections.emptyList(),
-                       Collections.emptyList(),
-                       cnxn);
-                break;
-            }
-            case OpCode.setWatches2: {
-                lastOp = "STW2";
-                SetWatches2 setWatches = new SetWatches2();
-                // TODO we really should not need this
-                request.request.rewind();
-                ByteBufferInputStream.byteBuffer2Record(request.request, setWatches);
-                long relativeZxid = setWatches.getRelativeZxid();
-                zks.getZKDatabase().setWatches(relativeZxid,
-                        setWatches.getDataWatches(),
-                        setWatches.getExistWatches(),
-                        setWatches.getChildWatches(),
-                        setWatches.getPersistentWatches(),
-                        setWatches.getPersistentRecursiveWatches(),
-                        cnxn);
-                break;
-            }
-            case OpCode.addWatch: {
-                lastOp = "ADDW";
-                AddWatchRequest addWatcherRequest = new AddWatchRequest();
-                ByteBufferInputStream.byteBuffer2Record(request.request,
-                        addWatcherRequest);
-                zks.getZKDatabase().addWatch(addWatcherRequest.getPath(), cnxn, addWatcherRequest.getMode());
-                rsp = new ErrorResponse(0);
-                break;
-            }
-            case OpCode.getACL: {
-                lastOp = "GETA";
-                GetACLRequest getACLRequest = new GetACLRequest();
-                ByteBufferInputStream.byteBuffer2Record(request.request, getACLRequest);
-                path = getACLRequest.getPath();
-                DataNode n = zks.getZKDatabase().getNode(path);
-                if (n == null) {
-                    throw new KeeperException.NoNodeException();
+                case OpCode.setWatches: {
+                    lastOp = "SETW";
+                    SetWatches setWatches = new SetWatches();
+                    // TODO we really should not need this
+                    request.request.rewind();
+                    ByteBufferInputStream.byteBuffer2Record(request.request, setWatches);
+                    long relativeZxid = setWatches.getRelativeZxid();
+                    zks.getZKDatabase()
+                            .setWatches(
+                                    relativeZxid,
+                                    setWatches.getDataWatches(),
+                                    setWatches.getExistWatches(),
+                                    setWatches.getChildWatches(),
+                                    Collections.emptyList(),
+                                    Collections.emptyList(),
+                                    cnxn);
+                    break;
                 }
-                zks.checkACL(
-                    request.cnxn,
-                    zks.getZKDatabase().aclForNode(n),
-                    ZooDefs.Perms.READ | ZooDefs.Perms.ADMIN, request.authInfo, path,
-                    null);
-
-                Stat stat = new Stat();
-                List<ACL> acl = zks.getZKDatabase().getACL(path, stat);
-                requestPathMetricsCollector.registerRequest(request.type, getACLRequest.getPath());
-
-                try {
+                case OpCode.setWatches2: {
+                    lastOp = "STW2";
+                    SetWatches2 setWatches = new SetWatches2();
+                    // TODO we really should not need this
+                    request.request.rewind();
+                    ByteBufferInputStream.byteBuffer2Record(request.request, setWatches);
+                    long relativeZxid = setWatches.getRelativeZxid();
+                    zks.getZKDatabase().setWatches(relativeZxid,
+                            setWatches.getDataWatches(),
+                            setWatches.getExistWatches(),
+                            setWatches.getChildWatches(),
+                            setWatches.getPersistentWatches(),
+                            setWatches.getPersistentRecursiveWatches(),
+                            cnxn);
+                    break;
+                }
+                case OpCode.addWatch: {
+                    lastOp = "ADDW";
+                    AddWatchRequest addWatcherRequest = new AddWatchRequest();
+                    ByteBufferInputStream.byteBuffer2Record(request.request,
+                            addWatcherRequest);
+                    zks.getZKDatabase().addWatch(addWatcherRequest.getPath(), cnxn, addWatcherRequest.getMode());
+                    rsp = new ErrorResponse(0);
+                    break;
+                }
+                case OpCode.getACL: {
+                    lastOp = "GETA";
+                    GetACLRequest getACLRequest = new GetACLRequest();
+                    ByteBufferInputStream.byteBuffer2Record(request.request, getACLRequest);
+                    path = getACLRequest.getPath();
+                    DataNode n = zks.getZKDatabase().getNode(path);
+                    if (n == null) {
+                        throw new KeeperException.NoNodeException();
+                    }
                     zks.checkACL(
-                        request.cnxn,
-                        zks.getZKDatabase().aclForNode(n),
-                        ZooDefs.Perms.ADMIN,
-                        request.authInfo,
-                        path,
-                        null);
-                    rsp = new GetACLResponse(acl, stat);
-                } catch (KeeperException.NoAuthException e) {
-                    List<ACL> acl1 = new ArrayList<ACL>(acl.size());
-                    for (ACL a : acl) {
-                        if ("digest".equals(a.getId().getScheme())) {
-                            Id id = a.getId();
-                            Id id1 = new Id(id.getScheme(), id.getId().replaceAll(":.*", ":x"));
-                            acl1.add(new ACL(a.getPerms(), id1));
-                        } else {
-                            acl1.add(a);
+                            request.cnxn,
+                            zks.getZKDatabase().aclForNode(n),
+                            ZooDefs.Perms.READ | ZooDefs.Perms.ADMIN, request.authInfo, path,
+                            null);
+
+                    Stat stat = new Stat();
+                    List<ACL> acl = zks.getZKDatabase().getACL(path, stat);
+                    requestPathMetricsCollector.registerRequest(request.type, getACLRequest.getPath());
+
+                    try {
+                        zks.checkACL(
+                                request.cnxn,
+                                zks.getZKDatabase().aclForNode(n),
+                                ZooDefs.Perms.ADMIN,
+                                request.authInfo,
+                                path,
+                                null);
+                        rsp = new GetACLResponse(acl, stat);
+                    } catch (KeeperException.NoAuthException e) {
+                        List<ACL> acl1 = new ArrayList<ACL>(acl.size());
+                        for (ACL a : acl) {
+                            if ("digest".equals(a.getId().getScheme())) {
+                                Id id = a.getId();
+                                Id id1 = new Id(id.getScheme(), id.getId().replaceAll(":.*", ":x"));
+                                acl1.add(new ACL(a.getPerms(), id1));
+                            } else {
+                                acl1.add(a);
+                            }
+                        }
+                        rsp = new GetACLResponse(acl1, stat);
+                    }
+                    break;
+                }
+                case OpCode.getChildren: {
+                    lastOp = "GETC";
+                    GetChildrenRequest getChildrenRequest = new GetChildrenRequest();
+                    ByteBufferInputStream.byteBuffer2Record(request.request, getChildrenRequest);
+                    path = getChildrenRequest.getPath();
+                    rsp = handleGetChildrenRequest(getChildrenRequest, cnxn, request.authInfo);
+                    requestPathMetricsCollector.registerRequest(request.type, path);
+                    break;
+                }
+                case OpCode.getAllChildrenNumber: {
+                    lastOp = "GETACN";
+                    GetAllChildrenNumberRequest getAllChildrenNumberRequest = new GetAllChildrenNumberRequest();
+                    ByteBufferInputStream.byteBuffer2Record(request.request, getAllChildrenNumberRequest);
+                    path = getAllChildrenNumberRequest.getPath();
+                    DataNode n = zks.getZKDatabase().getNode(path);
+                    if (n == null) {
+                        throw new KeeperException.NoNodeException();
+                    }
+                    zks.checkACL(
+                            request.cnxn,
+                            zks.getZKDatabase().aclForNode(n),
+                            ZooDefs.Perms.READ,
+                            request.authInfo,
+                            path,
+                            null);
+                    int number = zks.getZKDatabase().getAllChildrenNumber(path);
+                    rsp = new GetAllChildrenNumberResponse(number);
+                    break;
+                }
+                case OpCode.getChildren2: {
+                    lastOp = "GETC";
+                    GetChildren2Request getChildren2Request = new GetChildren2Request();
+                    ByteBufferInputStream.byteBuffer2Record(request.request, getChildren2Request);
+                    Stat stat = new Stat();
+                    path = getChildren2Request.getPath();
+                    DataNode n = zks.getZKDatabase().getNode(path);
+                    if (n == null) {
+                        throw new KeeperException.NoNodeException();
+                    }
+                    zks.checkACL(
+                            request.cnxn,
+                            zks.getZKDatabase().aclForNode(n),
+                            ZooDefs.Perms.READ,
+                            request.authInfo, path,
+                            null);
+                    List<String> children = zks.getZKDatabase()
+                            .getChildren(path, stat, getChildren2Request.getWatch() ? cnxn : null);
+                    rsp = new GetChildren2Response(children, stat);
+                    requestPathMetricsCollector.registerRequest(request.type, path);
+                    break;
+                }
+                case OpCode.checkWatches: {
+                    lastOp = "CHKW";
+                    CheckWatchesRequest checkWatches = new CheckWatchesRequest();
+                    ByteBufferInputStream.byteBuffer2Record(request.request, checkWatches);
+                    WatcherType type = WatcherType.fromInt(checkWatches.getType());
+                    path = checkWatches.getPath();
+                    boolean containsWatcher = zks.getZKDatabase().containsWatcher(path, type, cnxn);
+                    if (!containsWatcher) {
+                        String msg = String.format(Locale.ENGLISH, "%s (type: %s)", path, type);
+                        throw new KeeperException.NoWatcherException(msg);
+                    }
+                    requestPathMetricsCollector.registerRequest(request.type, checkWatches.getPath());
+                    break;
+                }
+                case OpCode.removeWatches: {
+                    lastOp = "REMW";
+                    RemoveWatchesRequest removeWatches = new RemoveWatchesRequest();
+                    ByteBufferInputStream.byteBuffer2Record(request.request, removeWatches);
+                    WatcherType type = WatcherType.fromInt(removeWatches.getType());
+                    path = removeWatches.getPath();
+                    boolean removed = zks.getZKDatabase().removeWatch(path, type, cnxn);
+                    if (!removed) {
+                        String msg = String.format(Locale.ENGLISH, "%s (type: %s)", path, type);
+                        throw new KeeperException.NoWatcherException(msg);
+                    }
+                    requestPathMetricsCollector.registerRequest(request.type, removeWatches.getPath());
+                    break;
+                }
+                case OpCode.whoAmI: {
+                    lastOp = "HOMI";
+                    rsp = new WhoAmIResponse(AuthUtil.getClientInfos(request.authInfo));
+                    break;
+                }
+                case OpCode.getEphemerals: {
+                    lastOp = "GETE";
+                    GetEphemeralsRequest getEphemerals = new GetEphemeralsRequest();
+                    ByteBufferInputStream.byteBuffer2Record(request.request, getEphemerals);
+                    String prefixPath = getEphemerals.getPrefixPath();
+                    Set<String> allEphems = zks.getZKDatabase().getDataTree().getEphemerals(request.sessionId);
+                    List<String> ephemerals = new ArrayList<>();
+                    if (prefixPath == null || prefixPath.trim().isEmpty() || "/".equals(prefixPath.trim())) {
+                        ephemerals.addAll(allEphems);
+                    } else {
+                        for (String p : allEphems) {
+                            if (p.startsWith(prefixPath)) {
+                                ephemerals.add(p);
+                            }
                         }
                     }
-                    rsp = new GetACLResponse(acl1, stat);
+                    rsp = new GetEphemeralsResponse(ephemerals);
+                    break;
                 }
-                break;
-            }
-            case OpCode.getChildren: {
-                lastOp = "GETC";
-                GetChildrenRequest getChildrenRequest = new GetChildrenRequest();
-                ByteBufferInputStream.byteBuffer2Record(request.request, getChildrenRequest);
-                path = getChildrenRequest.getPath();
-                rsp = handleGetChildrenRequest(getChildrenRequest, cnxn, request.authInfo);
-                requestPathMetricsCollector.registerRequest(request.type, path);
-                break;
-            }
-            case OpCode.getAllChildrenNumber: {
-                lastOp = "GETACN";
-                GetAllChildrenNumberRequest getAllChildrenNumberRequest = new GetAllChildrenNumberRequest();
-                ByteBufferInputStream.byteBuffer2Record(request.request, getAllChildrenNumberRequest);
-                path = getAllChildrenNumberRequest.getPath();
-                DataNode n = zks.getZKDatabase().getNode(path);
-                if (n == null) {
-                    throw new KeeperException.NoNodeException();
-                }
-                zks.checkACL(
-                    request.cnxn,
-                    zks.getZKDatabase().aclForNode(n),
-                    ZooDefs.Perms.READ,
-                    request.authInfo,
-                    path,
-                    null);
-                int number = zks.getZKDatabase().getAllChildrenNumber(path);
-                rsp = new GetAllChildrenNumberResponse(number);
-                break;
-            }
-            case OpCode.getChildren2: {
-                lastOp = "GETC";
-                GetChildren2Request getChildren2Request = new GetChildren2Request();
-                ByteBufferInputStream.byteBuffer2Record(request.request, getChildren2Request);
-                Stat stat = new Stat();
-                path = getChildren2Request.getPath();
-                DataNode n = zks.getZKDatabase().getNode(path);
-                if (n == null) {
-                    throw new KeeperException.NoNodeException();
-                }
-                zks.checkACL(
-                    request.cnxn,
-                    zks.getZKDatabase().aclForNode(n),
-                    ZooDefs.Perms.READ,
-                    request.authInfo, path,
-                    null);
-                List<String> children = zks.getZKDatabase()
-                                           .getChildren(path, stat, getChildren2Request.getWatch() ? cnxn : null);
-                rsp = new GetChildren2Response(children, stat);
-                requestPathMetricsCollector.registerRequest(request.type, path);
-                break;
-            }
-            case OpCode.checkWatches: {
-                lastOp = "CHKW";
-                CheckWatchesRequest checkWatches = new CheckWatchesRequest();
-                ByteBufferInputStream.byteBuffer2Record(request.request, checkWatches);
-                WatcherType type = WatcherType.fromInt(checkWatches.getType());
-                path = checkWatches.getPath();
-                boolean containsWatcher = zks.getZKDatabase().containsWatcher(path, type, cnxn);
-                if (!containsWatcher) {
-                    String msg = String.format(Locale.ENGLISH, "%s (type: %s)", path, type);
-                    throw new KeeperException.NoWatcherException(msg);
-                }
-                requestPathMetricsCollector.registerRequest(request.type, checkWatches.getPath());
-                break;
-            }
-            case OpCode.removeWatches: {
-                lastOp = "REMW";
-                RemoveWatchesRequest removeWatches = new RemoveWatchesRequest();
-                ByteBufferInputStream.byteBuffer2Record(request.request, removeWatches);
-                WatcherType type = WatcherType.fromInt(removeWatches.getType());
-                path = removeWatches.getPath();
-                boolean removed = zks.getZKDatabase().removeWatch(path, type, cnxn);
-                if (!removed) {
-                    String msg = String.format(Locale.ENGLISH, "%s (type: %s)", path, type);
-                    throw new KeeperException.NoWatcherException(msg);
-                }
-                requestPathMetricsCollector.registerRequest(request.type, removeWatches.getPath());
-                break;
-            }
-            case OpCode.whoAmI: {
-                lastOp = "HOMI";
-                rsp = new WhoAmIResponse(AuthUtil.getClientInfos(request.authInfo));
-                break;
-             }
-            case OpCode.getEphemerals: {
-                lastOp = "GETE";
-                GetEphemeralsRequest getEphemerals = new GetEphemeralsRequest();
-                ByteBufferInputStream.byteBuffer2Record(request.request, getEphemerals);
-                String prefixPath = getEphemerals.getPrefixPath();
-                Set<String> allEphems = zks.getZKDatabase().getDataTree().getEphemerals(request.sessionId);
-                List<String> ephemerals = new ArrayList<>();
-                if (prefixPath == null || prefixPath.trim().isEmpty() || "/".equals(prefixPath.trim())) {
-                    ephemerals.addAll(allEphems);
-                } else {
-                    for (String p : allEphems) {
-                        if (p.startsWith(prefixPath)) {
-                            ephemerals.add(p);
-                        }
-                    }
-                }
-                rsp = new GetEphemeralsResponse(ephemerals);
-                break;
-            }
             }
         } catch (SessionMovedException e) {
             // session moved is a connection level error, we need to tear
@@ -633,6 +647,7 @@ public class FinalRequestProcessor implements RequestProcessor {
             }
 
             if (request.type == OpCode.closeSession) {
+                // 发送closeConn请求
                 cnxn.sendCloseSession();
             }
         } catch (IOException e) {
@@ -651,7 +666,7 @@ public class FinalRequestProcessor implements RequestProcessor {
         }
         zks.checkACL(cnxn, zks.getZKDatabase().aclForNode(n), ZooDefs.Perms.READ, authInfo, path, null);
         List<String> children = zks.getZKDatabase()
-                                   .getChildren(path, null, getChildrenRequest.getWatch() ? cnxn : null);
+                .getChildren(path, null, getChildrenRequest.getWatch() ? cnxn : null);
         return new GetChildrenResponse(children);
     }
 

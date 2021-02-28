@@ -18,7 +18,13 @@
 
 package org.apache.zookeeper.server.quorum;
 
-import static java.nio.charset.StandardCharsets.UTF_8;
+import org.apache.zookeeper.jmx.MBeanRegistry;
+import org.apache.zookeeper.server.Request;
+import org.apache.zookeeper.server.ZKDatabase;
+import org.apache.zookeeper.server.quorum.auth.QuorumAuthServer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.BufferedInputStream;
 import java.io.ByteArrayInputStream;
 import java.io.DataInputStream;
@@ -27,29 +33,17 @@ import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketAddress;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
+import java.util.*;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
-import org.apache.zookeeper.jmx.MBeanRegistry;
-import org.apache.zookeeper.server.Request;
-import org.apache.zookeeper.server.ZKDatabase;
-import org.apache.zookeeper.server.quorum.auth.QuorumAuthServer;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+
+import static java.nio.charset.StandardCharsets.UTF_8;
 
 /**
  * Used by Followers to host Observers. This reduces the network load on the Leader process by pushing
  * the responsibility for keeping Observers in sync off the leading peer.
+ *
+ * 用来主导Observer与Leader保持数据同步，follower作为Observer Master将数据发送给Observer，而不需要通过Leader，减轻leader的压力
  *
  * It is expected that Observers will continue to perform the initial vetting of clients and requests.
  * Observers send the request to the follower where it is received by an ObserverMaster.

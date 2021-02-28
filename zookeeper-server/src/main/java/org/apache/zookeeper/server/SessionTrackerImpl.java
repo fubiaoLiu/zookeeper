@@ -18,6 +18,12 @@
 
 package org.apache.zookeeper.server;
 
+import org.apache.zookeeper.KeeperException;
+import org.apache.zookeeper.KeeperException.SessionExpiredException;
+import org.apache.zookeeper.common.Time;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.text.MessageFormat;
@@ -29,11 +35,6 @@ import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicLong;
-import org.apache.zookeeper.KeeperException;
-import org.apache.zookeeper.KeeperException.SessionExpiredException;
-import org.apache.zookeeper.common.Time;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * This is a full featured SessionTracker. It tracks session in grouped by tick
@@ -96,7 +97,11 @@ public class SessionTrackerImpl extends ZooKeeperCriticalThread implements Sessi
      */
     public static long initializeNextSessionId(long id) {
         long nextSid;
+        // 当前时间左移24位再右移8位
+        // 0000 0000 1011 1011 1101 1111 0100 0101 1100 1101 0001 0000 0000 0000 0000
         nextSid = (Time.currentElapsedTime() << 24) >>> 8;
+        // serverId左移56位，再与上nextSid，假设serverId是1
+        // 0000 0001 1011 1011 1101 1111 0100 0101 1100 1101 0001 0000 0000 0000 0000
         nextSid = nextSid | (id << 56);
         if (nextSid == EphemeralType.CONTAINER_EPHEMERAL_OWNER) {
             ++nextSid;  // this is an unlikely edge case, but check it just in case
@@ -111,6 +116,8 @@ public class SessionTrackerImpl extends ZooKeeperCriticalThread implements Sessi
         this.expirer = expirer;
         this.sessionExpiryQueue = new ExpiryQueue<SessionImpl>(tickTime);
         this.sessionsWithTimeout = sessionsWithTimeout;
+        // 初始化下一个sessionId，通过二进制位运算实现唯一性
+        // 前8位是serverId，中间40位是时间错，最后16位是自增长的值
         this.nextSessionId.set(initializeNextSessionId(serverId));
         for (Entry<Long, Integer> e : sessionsWithTimeout.entrySet()) {
             trackSession(e.getKey(), e.getValue());
@@ -178,6 +185,7 @@ public class SessionTrackerImpl extends ZooKeeperCriticalThread implements Sessi
     public synchronized boolean touchSession(long sessionId, int timeout) {
         SessionImpl s = sessionsById.get(sessionId);
 
+        // 如果session不存在，或session已关闭，则抛出MissingSessionException异常，并返回false，表示session无效
         if (s == null) {
             logTraceTouchInvalidSession(sessionId, timeout);
             return false;
@@ -200,10 +208,10 @@ public class SessionTrackerImpl extends ZooKeeperCriticalThread implements Sessi
     private void logTraceTouchSession(long sessionId, int timeout, String sessionStatus) {
         if (LOG.isTraceEnabled()) {
             String msg = MessageFormat.format(
-                "SessionTrackerImpl --- Touch {0}session: 0x{1} with timeout {2}",
-                sessionStatus,
-                Long.toHexString(sessionId),
-                Integer.toString(timeout));
+                    "SessionTrackerImpl --- Touch {0}session: 0x{1} with timeout {2}",
+                    sessionStatus,
+                    Long.toHexString(sessionId),
+                    Integer.toString(timeout));
 
             ZooTrace.logTraceMessage(LOG, ZooTrace.CLIENT_PING_TRACE_MASK, msg);
         }
@@ -239,9 +247,9 @@ public class SessionTrackerImpl extends ZooKeeperCriticalThread implements Sessi
         sessionsWithTimeout.remove(sessionId);
         if (LOG.isTraceEnabled()) {
             ZooTrace.logTraceMessage(
-                LOG,
-                ZooTrace.SESSION_TRACE_MASK,
-                "SessionTrackerImpl --- Removing session 0x" + Long.toHexString(sessionId));
+                    LOG,
+                    ZooTrace.SESSION_TRACE_MASK,
+                    "SessionTrackerImpl --- Removing session 0x" + Long.toHexString(sessionId));
         }
         if (s != null) {
             sessionExpiryQueue.remove(s);
@@ -286,10 +294,10 @@ public class SessionTrackerImpl extends ZooKeeperCriticalThread implements Sessi
         if (LOG.isTraceEnabled()) {
             String actionStr = added ? "Adding" : "Existing";
             ZooTrace.logTraceMessage(
-                LOG,
-                ZooTrace.SESSION_TRACE_MASK,
-                "SessionTrackerImpl --- " + actionStr
-                + " session 0x" + Long.toHexString(id) + " " + sessionTimeout);
+                    LOG,
+                    ZooTrace.SESSION_TRACE_MASK,
+                    "SessionTrackerImpl --- " + actionStr
+                            + " session 0x" + Long.toHexString(id) + " " + sessionTimeout);
         }
 
         updateSessionExpiry(session, sessionTimeout);

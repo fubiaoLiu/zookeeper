@@ -18,7 +18,6 @@
 
 package org.apache.zookeeper.server.quorum;
 
-import java.io.IOException;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.ZooDefs.OpCode;
 import org.apache.zookeeper.server.Request;
@@ -27,9 +26,15 @@ import org.apache.zookeeper.txn.ErrorTxn;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
+
 /**
  * Responsible for performing local session upgrade. Only request submitted
  * directly to the leader should go through this processor.
+ *
+ * 负责执行本地会话升级。会话升级是干啥的？暂时还没弄清楚。
+ *
+ * 只有直接提交给leader的请求才会通过这个处理器。
  */
 public class LeaderRequestProcessor implements RequestProcessor {
 
